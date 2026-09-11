@@ -1,0 +1,26 @@
+# ── Client data must never reach the repo ────────────────────────────────────
+# GitHub Pages serves every file in the branch, so anything committed here is
+# readable at a URL whether or not the repo itself is private.
+*.xlsx
+*.xls
+*.csv
+_test.*
+
+# ── Internal notes ───────────────────────────────────────────────────────────
+# These carry real pricing and at least one real client name in their worked
+# examples. They are the team's working notes, not part of the app, and Pages
+# would publish them at /SETUP.md and friends.
+SETUP.md
+SHAREPOINT-BUILD.md
+CHANGELOG.md
+DEMO.md
+ENTRA-REQUEST.md
+
+# ── Build and dev tooling, not runtime ───────────────────────────────────────
+# The app is one file with no build step; these produce or serve it locally.
+*.ps1
+
+# ── Source art ───────────────────────────────────────────────────────────────
+# ~2MB each. The sidebar ships as sampled gradient stops inside index.html.
+Light Portrait.png
+Dark Portrait.png
