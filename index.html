@@ -454,6 +454,7 @@ td input.num{text-align:right}
         <div class="sub" id="pgSub">No run loaded</div>
       </div>
       <div class="top-actions" id="topActions"></div>
+      <span id="saveState" class="pill no-print" hidden></span>
       <button id="themeBtn" class="icon-btn no-print" type="button" aria-label="Theme"></button>
     </header>
     <div id="demoBar" class="demo-bar no-print" hidden></div>
@@ -908,7 +909,9 @@ const state = {
      connected app is still working out who is at the keyboard. */
   identity: null,
   authState: "",          // "" | "signing-in" | "ready" | "denied" | "error"
-  authError: ""
+  authError: "",
+  saveState: "",          // "" | "pending" | "saving" | "saved" | "error"
+  saveError: ""
 };
 
 function loadAll() {
@@ -1099,10 +1102,13 @@ function matchFundDetail(r, index) {
 }
 
 
-const saveRateCard = () => store.write(LS.rateCard, state.rateCard);
-const saveAdvisers = () => store.write(LS.advisers, state.advisers);
-const saveFunds = () => store.write(LS.funds, state.funds);
-const saveRuns = () => store.write(LS.runs, state.runs);
+/* Local mode writes to this browser; connected, the same call queues a write to
+   SharePoint. Every caller in the app is unchanged either way — this is the
+   seam the whole thing was built around. */
+const saveRateCard = () => localMode() ? store.write(LS.rateCard, state.rateCard) : queueSave("rateCard");
+const saveAdvisers = () => localMode() ? store.write(LS.advisers, state.advisers) : queueSave("advisers");
+const saveFunds = () => localMode() ? store.write(LS.funds, state.funds) : queueSave("funds");
+const saveRuns = () => localMode() ? store.write(LS.runs, state.runs) : queueSave("runs");
 const saveUi = () => store.write(LS.ui, {
   runKey: state.runKey, role: state.role, asAdviser: state.asAdviser,
   navCollapsed: state.navCollapsed, theme: state.theme,
@@ -1219,6 +1225,140 @@ async function graph(path, opts = {}) {
 }
 
 /* =========================================================================
+   SharePoint
+
+   Reads happen once, into state, so the four hundred places that read
+   state.runs or state.rateCard stay synchronous and unchanged. Only writes
+   are asynchronous, and they go through a debounced queue — the app saves on
+   every keystroke, which is free against localStorage and a PATCH per
+   character against Graph.
+
+   Client data is never cached. The monthly extract is fetched into memory when
+   a run is opened and is gone when the tab closes, which is the point: nothing
+   client-identifying is left in a browser profile on a shared machine.
+   ========================================================================= */
+const sp = {
+  siteId: null,
+  lists: {},              // key -> list id
+  driveId: null,          // the document library, addressed as a drive
+  rateCardId: null,
+  fundIds: [],            // parallel to state.funds
+  adviserIds: [],         // parallel to state.advisers
+  runIds: {},             // runKey -> item id
+  overrideIds: {},        // runKey -> adviser -> item id
+  lastOverride: {}        // runKey -> adviser -> the JSON last written, to skip no-op writes
+};
+
+const normTitle = s => String(s || "").toLowerCase().replace(/[\s_-]/g, "");
+
+async function spResolve() {
+  if (sp.siteId) return;
+  const site = await graph("/sites/" + CONFIG.sitePath + "?$select=id");
+  sp.siteId = site.id;
+  const lists = (await graph("/sites/" + sp.siteId + "/lists?$select=id,name,displayName")).value || [];
+  const find = title => {
+    const hit = lists.find(l => normTitle(l.displayName) === normTitle(title))
+             || lists.find(l => normTitle(l.name) === normTitle(title));
+    if (!hit) throw new Error('The list "' + title + '" was not found on the site. Settings → Check lists says exactly what is missing.');
+    return hit;
+  };
+  for (const k of Object.keys(LIST_TITLES)) sp.lists[k] = find(LIST_TITLES[k]).id;
+  const lib = find(DOC_LIBRARY);
+  sp.driveId = (await graph("/sites/" + sp.siteId + "/lists/" + lib.id + "/drive?$select=id")).id;
+}
+
+const spPath = key => "/sites/" + sp.siteId + "/lists/" + sp.lists[key];
+const spItems = async key => (await graph(spPath(key) + "/items?expand=fields&$top=999")).value || [];
+const spCreate = (key, fields) => graph(spPath(key) + "/items", { method: "POST", body: { fields } });
+const spUpdate = (key, id, fields) => graph(spPath(key) + "/items/" + id + "/fields", { method: "PATCH", body: fields });
+const spDelete = (key, id) => graph(spPath(key) + "/items/" + id, { method: "DELETE" });
+
+/* The extract is a file, not list items: ~1,800 rows a month would be 22,000
+   list items a year against a 5,000-item view threshold. */
+const runFilePath = key => key.slice(0, 4) + "/" + key + "/rows.json";
+
+async function spPutFile(path, text) {
+  const token = await getToken(false);
+  const res = await fetch("https://graph.microsoft.com/v1.0/drives/" + sp.driveId +
+    "/root:/" + encodeURI(path) + ":/content",
+    { method: "PUT", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: text });
+  if (!res.ok) throw new Error("Could not save the extract (" + res.status + " " + res.statusText + ").");
+  return res.json();
+}
+
+async function spGetFile(path) {
+  const token = await getToken(false);
+  const res = await fetch("https://graph.microsoft.com/v1.0/drives/" + sp.driveId +
+    "/root:/" + encodeURI(path) + ":/content", { headers: { Authorization: "Bearer " + token } });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Could not read the extract (" + res.status + " " + res.statusText + ").");
+  return res.json();
+}
+
+/* ---- shapes: list row <-> the objects the app already works in ---- */
+
+function adviserFromRow(f) {
+  return {
+    name: String(f.Title || ""),
+    role: ROLES.includes(f.AccessRole) ? f.AccessRole : "Adviser",
+    region: String(f.Region || ""),
+    email: String(f.Email || ""),
+    active: f.IsActive !== false,
+    /* Set in SharePoint, not here — writing a person column needs the site
+       user id, and Email is the match that matters anyway. */
+    userName: personName(f.AdviserUser)
+  };
+}
+function adviserToFields(a) {
+  const f = { Title: a.name || "", AccessRole: a.role || "Adviser", Email: a.email || "", IsActive: a.active !== false };
+  if (a.region) f.Region = a.region;     // a Choice column rejects ""
+  return f;
+}
+
+function fundFromRow(f) {
+  return normaliseFund({
+    name: f.Title, aliases: f.Aliases, capPct: f.CapPercent, capAmount: f.CapAmount,
+    capInclGst: f.CapInclGst !== false, minBalance: f.MinBalance,
+    active: f.IsActive !== false, notes: f.Notes
+  });
+}
+function fundToFields(f) {
+  return {
+    Title: f.name || "", Aliases: (f.aliases || []).join("\n"),
+    CapPercent: num(f.capPct), CapAmount: num(f.capAmount),
+    CapInclGst: !!f.capInclGst, MinBalance: num(f.minBalance),
+    IsActive: !!f.active, Notes: f.notes || ""
+  };
+}
+
+/* One row per adviser per run, so two advisers reviewing at the same moment
+   never write the same item. The app holds overrides as one flat object, so
+   they are split on the way out by whose client each one touches. */
+function partitionOverrides(run) {
+  const owner = new Map();
+  if (state.calc) for (const m of state.calc.masters) owner.set(m.masterId, m.adviser || "");
+  const bucket = new Map();
+  const put = (adviser, k, v) => {
+    if (!bucket.has(adviser)) bucket.set(adviser, {});
+    bucket.get(adviser)[k] = v;
+  };
+  for (const k of Object.keys(run.overrides || {})) {
+    const body = k.slice(k.indexOf(":") + 1);
+    let masterId = "";
+    if (k.startsWith("master:") || k.startsWith("add:")) masterId = body;
+    else if (k.startsWith("row:")) {
+      masterId = body.startsWith("add~") ? (masterOfAddedFund(body.slice(4)) || "") : body.split("~")[1] || "";
+    }
+    put(owner.get(masterId) || "(unassigned)", k, run.overrides[k]);
+  }
+  /* Every adviser in the run gets a row even with no edits, because the row is
+     also where their status lives. */
+  for (const a of owner.values()) if (a && !bucket.has(a)) bucket.set(a, {});
+  for (const a of Object.keys(run.adviserStatus || {})) if (!bucket.has(a)) bucket.set(a, {});
+  return bucket;
+}
+
+/* =========================================================================
    Who you are
 
    The role decides which screens open, and it comes from the adviser directory
@@ -1242,15 +1382,11 @@ async function resolveIdentity() {
   const email = String(me.mail || me.userPrincipalName || "").toLowerCase();
   const name = String(me.displayName || "").trim();
 
-  const site = await graph("/sites/" + CONFIG.sitePath + "?$select=id");
-  const lists = (await graph("/sites/" + site.id + "/lists?$select=id,name,displayName")).value || [];
-  const norm = s => String(s || "").toLowerCase().replace(/[\s_-]/g, "");
-  const hit = lists.find(l => norm(l.displayName) === norm(LIST_TITLES.advisers))
-           || lists.find(l => norm(l.name) === norm(LIST_TITLES.advisers));
-  if (!hit) throw new Error('The "' + LIST_TITLES.advisers + '" list was not found on the site.');
-
-  const items = (await graph("/sites/" + site.id + "/lists/" + hit.id +
-    "/items?expand=fields&$top=999")).value || [];
+  await spResolve();
+  const items = await spItems("advisers");
+  /* Kept so the directory does not have to be read twice on the way in. */
+  sp.adviserIds = items.map(i => i.id);
+  state.advisers = items.map(i => adviserFromRow(i.fields || {}));
   const rows = items.map(i => i.fields || {}).filter(f => f.Title || f.AccessRole);
 
   /* Email first: it is an exact string we control, and it survives someone's
@@ -1284,6 +1420,357 @@ async function resolveIdentity() {
   if (ROLES.includes(row.AccessRole)) id.role = row.AccessRole;
   return id;
 }
+
+/* ---- reads ---- */
+
+async function loadReference() {
+  const cards = await spItems("rateCard");
+  const active = cards.find(i => (i.fields || {}).IsActive) || cards[cards.length - 1];
+  if (!active) {
+    sp.rateCardId = null;
+    state.rateCard = JSON.parse(JSON.stringify(EMPTY_RATE_CARD));
+  } else {
+    sp.rateCardId = active.id;
+    const f = active.fields || {};
+    let card;
+    try { card = JSON.parse(f.CardJson || "{}"); }
+    catch (e) { throw new Error("The rate card row's CardJson is not valid JSON. Fix it in SharePoint, or clear it and set the pricing again here."); }
+    state.rateCard = { ...JSON.parse(JSON.stringify(EMPTY_RATE_CARD)), ...card,
+      aliases: card.aliases || {}, legacyRates: card.legacyRates || {} };
+    if (!state.rateCard.version) state.rateCard.version = String(f.Title || "");
+  }
+
+  const funds = await spItems("funds");
+  sp.fundIds = funds.map(i => i.id);
+  state.funds = funds.map(i => fundFromRow(i.fields || {}));
+}
+
+/* Metadata only. The extract behind each run is a file and is fetched when
+   somebody actually opens that month. */
+async function loadRunIndex() {
+  const items = await spItems("runs");
+  state.runs = {};
+  sp.runIds = {};
+  for (const i of items) {
+    const f = i.fields || {};
+    const key = String(f.Title || "");
+    if (!/^\d{4}-\d{2}$/.test(key)) continue;
+    sp.runIds[key] = i.id;
+    let snap = {};
+    try { snap = JSON.parse(f.RateCardSnapshot || "{}"); } catch (e) { /* a run with an unreadable snapshot still opens */ }
+    state.runs[key] = {
+      key,
+      status: RUN_STATUS.includes(f.RunStatus) ? f.RunStatus : "Draft",
+      sourceName: String(f.SourceFile || ""),
+      rowCount: num(f.RowCount),
+      createdAt: i.createdDateTime || "",
+      rateCardSnapshot: snap.rateCard || null,
+      fundsSnapshot: snap.funds || [],
+      /* Read back so a later save of the same run rewrites it rather than
+         blanking the column. */
+      summary: (() => { try { return f.SummaryJson ? JSON.parse(f.SummaryJson) : null; } catch (e) { return null; } })(),
+      rows: null,               // not loaded yet — everything guards on this
+      overrides: {},
+      adviserStatus: {},
+      loaded: false
+    };
+  }
+  const keys = Object.keys(state.runs).sort();
+  if (!state.runKey || !state.runs[state.runKey]) state.runKey = keys.pop() || null;
+}
+
+async function loadRun(key) {
+  const run = state.runs[key];
+  if (!run || run.loaded) return;
+  const data = await spGetFile(runFilePath(key));
+  run.rows = (data && Array.isArray(data.rows)) ? data.rows : [];
+  run.isSample = false;
+
+  const items = await spItems("overrides");
+  run.overrides = {};
+  run.adviserStatus = {};
+  sp.overrideIds[key] = {};
+  sp.lastOverride[key] = {};
+  for (const i of items) {
+    const f = i.fields || {};
+    if (String(f.RunKey || "") !== key) continue;
+    const adviser = String(f.Adviser || "");
+    sp.overrideIds[key][adviser] = i.id;
+    let ov = {};
+    try { ov = JSON.parse(f.OverridesJson || "{}"); } catch (e) { /* one bad row must not sink the month */ }
+    Object.assign(run.overrides, ov);
+    sp.lastOverride[key][adviser] = JSON.stringify(ov);
+    run.adviserStatus[adviser] = {
+      status: ADVISER_STATUS.includes(f.AdviserStatus) ? f.AdviserStatus : "Not started",
+      submittedAt: f.SubmittedAt || null,
+      approvedAt: f.ApprovedAt || null,
+      approver: personName(f.Approver),
+      note: String(f.ReturnNote || "")
+    };
+  }
+  run.loaded = true;
+}
+
+/* ---- writes ----
+   Debounced and coalesced: twenty keystrokes in a row are one PATCH. The state
+   is shown in the top bar and leaving with something unsaved is warned about,
+   because a save that quietly failed is worse than no save at all. */
+const saver = { pending: new Set(), timer: null, busy: false, failed: 0 };
+
+function queueSave(what) {
+  if (localMode()) return;
+  saver.pending.add(what);
+  state.saveState = "pending";
+  paintSaveState();
+  clearTimeout(saver.timer);
+  saver.timer = setTimeout(flushSaves, 1200);
+}
+
+async function flushSaves() {
+  if (saver.busy || !saver.pending.size) return;
+  saver.busy = true;
+  const doing = [...saver.pending];
+  saver.pending.clear();
+  state.saveState = "saving";
+  paintSaveState();
+  try {
+    for (const what of doing) {
+      if (what === "rateCard") await writeRateCard();
+      else if (what === "funds") await writeFunds();
+      else if (what === "advisers") await writeAdvisers();
+      else if (what === "runs") await writeRun();
+    }
+    saver.failed = 0;
+    state.saveState = "saved";
+    state.saveError = "";
+  } catch (e) {
+    /* Put the work back so the next edit, or the retry, picks it up again. */
+    for (const w of doing) saver.pending.add(w);
+    saver.failed++;
+    state.saveState = "error";
+    state.saveError = (e && e.message) || String(e);
+    if (saver.failed <= 3) setTimeout(flushSaves, 4000 * saver.failed);
+  }
+  saver.busy = false;
+  paintSaveState();
+  if (saver.pending.size && state.saveState !== "error") setTimeout(flushSaves, 200);
+}
+
+async function writeRateCard() {
+  const card = JSON.parse(JSON.stringify(state.rateCard));
+  const fields = { CardJson: JSON.stringify(card), IsActive: true, Title: card.version || "Current" };
+  if (sp.rateCardId) await spUpdate("rateCard", sp.rateCardId, fields);
+  else sp.rateCardId = (await spCreate("rateCard", { ...fields, EffectiveFrom: new Date().toISOString() })).id;
+}
+
+/* Row by row, because the fund table is edited a row at a time and a whole-list
+   rewrite would churn every item's Modified stamp on one cap change. */
+async function writeFunds() {
+  for (let i = 0; i < state.funds.length; i++) {
+    const fields = fundToFields(state.funds[i]);
+    if (sp.fundIds[i]) await spUpdate("funds", sp.fundIds[i], fields);
+    else sp.fundIds[i] = (await spCreate("funds", fields)).id;
+  }
+  while (sp.fundIds.length > state.funds.length) {
+    const gone = sp.fundIds.pop();
+    if (gone) await spDelete("funds", gone);
+  }
+}
+
+async function writeAdvisers() {
+  for (let i = 0; i < state.advisers.length; i++) {
+    const fields = adviserToFields(state.advisers[i]);
+    if (sp.adviserIds[i]) await spUpdate("advisers", sp.adviserIds[i], fields);
+    else sp.adviserIds[i] = (await spCreate("advisers", fields)).id;
+  }
+  while (sp.adviserIds.length > state.advisers.length) {
+    const gone = sp.adviserIds.pop();
+    if (gone) await spDelete("advisers", gone);
+  }
+}
+
+async function writeRun() {
+  const run = currentRun();
+  if (!run || !run.loaded) return;
+  const key = run.key;
+
+  const runFields = {
+    RunStatus: run.status,
+    RowCount: (run.rows || []).length,
+    SourceFile: run.sourceName || "",
+    RateCardSnapshot: JSON.stringify({ rateCard: run.rateCardSnapshot, funds: run.fundsSnapshot })
+  };
+  if (run.summary) {
+    const json = JSON.stringify(run.summary);
+    /* The column's ceiling. Rollups should never come close, but a firm that
+       trebles its adviser count should find out here rather than by having a
+       write rejected. */
+    if (json.length > 60000) {
+      runFields.SummaryJson = JSON.stringify({ v: 1, runKey: key, truncated: true,
+        totals: run.summary.totals, lockedAt: run.summary.lockedAt });
+    } else {
+      runFields.SummaryJson = json;
+    }
+    runFields.LockedAt = run.summary.lockedAt;
+    /* LockedBy is a person column and writing one needs the site user id, not
+       the Entra id — the same reason AdviserUser is not written. The name is
+       in the summary, and SharePoint's own Modified By records who did it. */
+  }
+  await spUpdate("runs", sp.runIds[key], runFields);
+
+  sp.overrideIds[key] = sp.overrideIds[key] || {};
+  sp.lastOverride[key] = sp.lastOverride[key] || {};
+  for (const [adviser, ov] of partitionOverrides(run)) {
+    const st = run.adviserStatus[adviser] || { status: "Not started" };
+    const json = JSON.stringify(ov);
+    const stamp = json + "|" + st.status + "|" + (st.note || "") + "|" + (st.submittedAt || "") + "|" + (st.approvedAt || "");
+    if (sp.lastOverride[key][adviser] === stamp) continue;      // nothing changed for this adviser
+    const fields = {
+      Title: key + " — " + adviser,
+      RunKey: key, Adviser: adviser,
+      AdviserStatus: st.status, OverridesJson: json,
+      SubmittedAt: st.submittedAt || null, ApprovedAt: st.approvedAt || null,
+      ReturnNote: st.note || ""
+    };
+    if (sp.overrideIds[key][adviser]) await spUpdate("overrides", sp.overrideIds[key][adviser], fields);
+    else sp.overrideIds[key][adviser] = (await spCreate("overrides", fields)).id;
+    sp.lastOverride[key][adviser] = stamp;
+  }
+}
+
+/* What a locked month leaves behind.
+
+   Rollups only — totals, and a line per adviser, per region, per category.
+   Deliberately NOT a line per client: a "Multiple lines of text" column holds
+   63,999 characters, and three hundred clients of detail would sail past that
+   at exactly the moment the firm got big enough to want the history. These
+   rollups are a couple of KB whatever happens.
+
+   Nothing is lost by that. The extract for every month is kept in the library,
+   so per-client history can be rebuilt if it is ever asked for; what cannot be
+   rebuilt cheaply is the adviser rollup at the moment of locking, because the
+   rate card and the caps have moved on since. */
+function buildRunSummary(run, calc) {
+  if (!calc) return null;
+  const ms = calc.masters;
+  const fumOf = list => [...new Set(list.map(m => m.fumKey))]
+    .reduce((a, k) => a + (list.find(m => m.fumKey === k).totalFum || 0), 0);
+  const r2 = n => Math.round((n || 0) * 100) / 100;
+
+  const group = (keyOf) => {
+    const g = new Map();
+    for (const m of ms) {
+      const k = keyOf(m) || "—";
+      if (!g.has(k)) g.set(k, []);
+      g.get(k).push(m);
+    }
+    return [...g].sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  };
+  const roll = list => ({
+    clients: list.length,
+    accounts: list.reduce((a, m) => a + m.rows.length, 0),
+    fum: r2(fumOf(list)),
+    current: r2(list.reduce((a, m) => a + (m.currentFee || 0), 0)),
+    proposed: r2(list.reduce((a, m) => a + (m.fee || 0), 0)),
+    offBand: list.filter(m => m.outsideBand).length,
+    belowCurrent: list.filter(m => m.belowCurrent).length,
+    platformIssues: list.filter(m => m.overCap || m.underMinBalance.length).length,
+    splits: list.filter(m => m.splitFunds.length).length
+  });
+
+  const id = state.identity;
+  return {
+    v: 1,
+    runKey: run.key,
+    lockedAt: new Date().toISOString(),
+    /* The person column is not written from here — see writeRun — so the name
+       lives in the summary, which is the thing a history view reads anyway. */
+    lockedBy: id ? { name: id.name, email: id.email } : null,
+    sourceFile: run.sourceName || "",
+    rateCardVersion: (run.rateCardSnapshot && run.rateCardSnapshot.version) || state.rateCard.version || "",
+    totals: { ...roll(ms), unpriced: ms.filter(m => m.baseFee == null).length,
+              hiddenDefaults: calc.hiddenDefaults, addedFunds: calc.addedFundCount },
+    advisers: group(m => m.adviser).map(([name, list]) => ({
+      name, region: (list[0] && list[0].region) || "—",
+      status: adviserState(name).status, ...roll(list)
+    })),
+    regions: group(m => m.region).map(([name, list]) => ({ name, ...roll(list) })),
+    categories: group(m => m.category).map(([name, list]) => ({
+      name, mappedTo: (list[0] && list[0].mappedTo) || null, ...roll(list)
+    }))
+  };
+}
+
+/* The extract file first, then the run row. That order matters: a run row with
+   no file behind it looks like a month that exists and opens empty, which is
+   worse than an orphaned file nobody reads. */
+async function publishRun(key, recs, fileName, existed) {
+  const run = state.runs[key];
+  state.saveState = "saving";
+  paintSaveState();
+  try {
+    await spPutFile(runFilePath(key), JSON.stringify({ runKey: key, sourceFile: fileName, rows: recs }));
+    const fields = {
+      Title: key,
+      RunYear: +key.slice(0, 4), RunMonth: +key.slice(5, 7),
+      RunStatus: run.status, RowCount: recs.length, SourceFile: fileName || "",
+      RateCardSnapshot: JSON.stringify({ rateCard: run.rateCardSnapshot, funds: run.fundsSnapshot })
+    };
+    if (sp.runIds[key]) await spUpdate("runs", sp.runIds[key], fields);
+    else sp.runIds[key] = (await spCreate("runs", fields)).id;
+
+    /* Replacing a month means its adviser edits are gone; leaving the old
+       override rows behind would silently reapply them to new client ids. */
+    if (existed) {
+      for (const [adviser, id] of Object.entries(sp.overrideIds[key] || {})) {
+        try { await spDelete("overrides", id); } catch (e) { /* already gone is fine */ }
+      }
+    }
+    sp.overrideIds[key] = {};
+    sp.lastOverride[key] = {};
+    run.loaded = true;
+    state.saveState = "saved";
+    paintSaveState();
+    render();
+    toast(recs.length.toLocaleString("en-AU") + " rows imported for " + monthLabel(key) + ".", "good");
+    celebrate();
+  } catch (e) {
+    /* The run is not on the site, so it must not look as though it is. */
+    delete state.runs[key];
+    state.runKey = Object.keys(state.runs).sort().pop() || null;
+    state.saveState = "error";
+    state.saveError = (e && e.message) || String(e);
+    paintSaveState();
+    render();
+    toast("Import failed — nothing was saved. " + state.saveError, "bad");
+  }
+}
+
+function paintSaveState() {
+  const el = $("#saveState");
+  if (!el) return;
+  const map = {
+    pending: ["", "Unsaved changes"],
+    saving:  ["", "Saving…"],
+    saved:   ["ok", "Saved"],
+    error:   ["bad", "Not saved"]
+  };
+  const m = map[state.saveState];
+  el.hidden = !m;
+  if (!m) return;
+  el.className = "pill " + m[0];
+  el.textContent = m[1];
+  el.title = state.saveState === "error"
+    ? "The last save failed: " + state.saveError + " — it will keep retrying, and your work is still on screen."
+    : "";
+}
+
+/* A dropped save must not leave silently. */
+addEventListener("beforeunload", e => {
+  if (localMode() || (!saver.pending.size && state.saveState !== "error")) return;
+  e.preventDefault();
+  e.returnValue = "";
+});
 
 /* =========================================================================
    Schema audit
@@ -2232,7 +2719,33 @@ function currentRun() { return state.runKey ? state.runs[state.runKey] : null; }
 
 function recalc() {
   const run = currentRun();
-  state.calc = run ? calculate(run) : null;
+  /* A connected run carries no rows until its month is opened, and every view
+     already knows what to do with no calc. */
+  state.calc = (run && Array.isArray(run.rows)) ? calculate(run) : null;
+}
+
+/* Local mode's leftovers are not this app's data once there is a real source
+   of truth, and a monthly extract has no business sitting in a browser profile
+   on a shared machine. The UI preferences stay — they are nobody's secret. */
+function clearLocalData() {
+  for (const k of [LS.rateCard, LS.advisers, LS.funds, LS.runs]) {
+    try { localStorage.removeItem(k); } catch (e) { /* a locked-down browser is fine */ }
+  }
+}
+
+/* Switching months fetches that month, because only the index is held. */
+async function openRun(key) {
+  if (!state.runs[key]) return;
+  state.runKey = key;
+  state.expanded = {};
+  state.expandedAdviser = {};
+  saveUi();
+  if (!localMode() && !state.runs[key].loaded) {
+    toast("Loading " + monthLabel(key) + "…");
+    try { await loadRun(key); }
+    catch (e) { toast("Could not load " + monthLabel(key) + ". " + ((e && e.message) || e), "bad"); }
+  }
+  render();
 }
 
 function setOverride(scope, id, patch) {
@@ -2369,6 +2882,18 @@ async function startSession() {
     /* An adviser is only ever themselves, and Title is what Xplan calls them —
        which is the name their clients are filed under. */
     state.asAdviser = id.role === "Adviser" && id.row ? String(id.row.Title || "") : null;
+
+    /* Anything this browser was holding from local mode is not this app's
+       data any more, and client records have no business sitting in a profile
+       once there is a real source of truth. */
+    clearLocalData();
+
+    state.authState = "loading";
+    renderGate();
+    await loadReference();
+    await loadRunIndex();
+    if (state.runKey) await loadRun(state.runKey);
+
     state.authState = "ready";
     saveUi();
     render();
@@ -2402,6 +2927,10 @@ function renderGate() {
     html = card('<h2 style="margin-bottom:8px">Signing in…</h2>' +
       '<div class="muted">Checking who you are against the adviser directory. ' +
       "If a Microsoft sign-in page opens, that is this app asking.</div>");
+  } else if (state.authState === "loading") {
+    html = card('<h2 style="margin-bottom:8px">Loading…</h2>' +
+      '<div class="muted">Reading the rate card, the fund table and this month\'s run from SharePoint. ' +
+      "Client data is never kept on this machine, so it is fetched fresh each time.</div>");
   } else if (state.authState === "error") {
     html = card('<h2 style="margin-bottom:10px">Could not sign in</h2>' +
       '<div class="banner bad" style="margin:0 0 14px">' + state.authError + "</div>" +
@@ -2480,6 +3009,7 @@ function render() {
       : "Local mode — no sign-in";
   $("#whoAvatar").textContent = initials(who);
   renderTopActions();
+  paintSaveState();
 
   const fn = { run: viewRun, review: viewReview, exceptions: viewExceptions,
                approvals: viewApprovals, ratecard: viewRateCard, people: viewPeople, settings: viewSettings }[state.view];
@@ -2552,7 +3082,7 @@ function renderTopActions() {
   $("#topActions").innerHTML = html;
 
   const pick = $("#runPick");
-  if (pick) pick.addEventListener("change", e => { state.runKey = e.target.value; saveUi(); render(); });
+  if (pick) pick.addEventListener("change", e => openRun(e.target.value));
   const asPick = $("#asAdviser");
   if (asPick) asPick.addEventListener("change", e => { state.asAdviser = e.target.value; state.expanded = {}; saveUi(); render(); });
   $("#topActions").querySelectorAll("[data-role]").forEach(b =>
@@ -2568,6 +3098,10 @@ function renderTopActions() {
       " adviser" + (outstanding.length > 1 ? "s have" : " has") + " not been approved yet:\n" +
       outstanding.slice(0, 8).join("\n") + (outstanding.length > 8 ? "\n…and " + (outstanding.length - 8) + " more" : "") +
       "\n\nLocking makes every client read-only.")) return;
+    /* The month's shape, captured at the one moment it is finished. Built
+       before the status change so it is written by the same save. */
+    const r = currentRun();
+    if (r) r.summary = buildRunSummary(r, state.calc);
     setStatus("Locked");
     celebrate();
   });
@@ -4317,11 +4851,23 @@ function openImportDialog(fileName, recs, missing) {
     if (state.runs[monthKey] && !confirm(
       "A run already exists for " + monthLabel(monthKey) + ".\n\nReplacing it discards every adviser edit and approval for that month. Continue?")) return false;
 
+    const existed = !!state.runs[monthKey];
     state.runs[monthKey] = newRun(monthKey, recs, fileName);
     state.runKey = monthKey;
-    saveRuns(); saveUi(); render();
-    toast(recs.length.toLocaleString("en-AU") + " rows imported for " + monthLabel(monthKey) + ".", "good");
-    celebrate();
+    saveUi();
+
+    if (localMode()) {
+      saveRuns();
+      render();
+      toast(recs.length.toLocaleString("en-AU") + " rows imported for " + monthLabel(monthKey) + ".", "good");
+      celebrate();
+      return true;
+    }
+
+    /* Connected, an import is three writes and none of them is a keystroke, so
+       it runs now rather than through the debounce — and the extract goes to
+       the library as a file, not as 1,800 list items. */
+    publishRun(monthKey, recs, fileName, existed);
     return true;
   }, () => {
     /* Live warning while they pick, so a clash is visible before they commit. */
@@ -4796,27 +5342,30 @@ $("#navToggle").addEventListener("click", () => {
 /* While nobody has pinned it, the viewport decides. */
 addEventListener("resize", () => { if (state.navCollapsed === null) applyNavWidth(); });
 
-if (!Object.keys(state.runs).length) {
-  const key = defaultMonth();
-  state.runs[key] = newRun(key, sampleRows(), SAMPLE_LABEL);
-  state.runs[key].status = "Open for Review";
-  state.runKey = key;
-  saveRuns(); saveUi();
-}
-/* Sample runs are disposable, so bring any stale one up to date rather than
-   leaving it pointing at advisers and pricing that no longer exist. */
-for (const [key, run] of Object.entries(state.runs)) {
-  if (run.isSample && run.sampleVersion !== SAMPLE_VERSION) {
-    state.runs[key] = newRun(key, sampleRows(), SAMPLE_LABEL);
-    state.runs[key].status = run.status || "Open for Review";
-  }
-}
-if (currentRun() && currentRun().isSample) installSampleReference();
-saveRuns();
-
+/* Sample data belongs to local mode only. Connected, the site is the source of
+   truth and an invented run would be indistinguishable from a real one. */
 if (localMode()) {
+  if (!Object.keys(state.runs).length) {
+    const key = defaultMonth();
+    state.runs[key] = newRun(key, sampleRows(), SAMPLE_LABEL);
+    state.runs[key].status = "Open for Review";
+    state.runKey = key;
+    saveRuns(); saveUi();
+  }
+  /* Sample runs are disposable, so bring any stale one up to date rather than
+     leaving it pointing at advisers and pricing that no longer exist. */
+  for (const [key, run] of Object.entries(state.runs)) {
+    if (run.isSample && run.sampleVersion !== SAMPLE_VERSION) {
+      state.runs[key] = newRun(key, sampleRows(), SAMPLE_LABEL);
+      state.runs[key].status = run.status || "Open for Review";
+    }
+  }
+  if (currentRun() && currentRun().isSample) installSampleReference();
+  saveRuns();
   render();
 } else {
+  state.runs = {};
+  state.runKey = null;
   /* Coming back from the Entra redirect there is already an account in the
      cache, so pick straight up rather than making somebody press sign in
      twice. Otherwise show the gate and wait to be asked. */
