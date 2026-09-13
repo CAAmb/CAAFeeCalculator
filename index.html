@@ -506,8 +506,19 @@ const LIST_TITLES = {
   overrides: "Fee Calculator Overrides",
   rateCard:  "Fee Calculator Rate Card",
   advisers:  "Fee Calculator Advisers",
-  funds:     "Fee Calculator Funds"
+  funds:     "Fee Calculator Funds",
+  /* Optional until the flows exist: the app degrades to writing nothing rather
+     than failing, so the site works before the automation is built. */
+  notifications: "Fee Calculator Notifications"
 };
+const OPTIONAL_LISTS = ["notifications"];
+
+/* The app never sends email. It writes a row and a Power Automate flow sends
+   it, which keeps Mail.Send off this application's permissions, keeps the
+   wording editable by the business, and leaves a record of every message. */
+const NOTIFY_KINDS = ["Review ready", "Reminder", "Completed", "Approved", "Returned"];
+const NOTIFY_STATUS = ["Scheduled", "Queued", "Sent", "Failed", "Cancelled"];
+const REMINDER_DAYS = 7;
 const DOC_LIBRARY = "Fee Calculator Data";
 
 /* The choice values these lists carry. Declared here rather than beside the code
@@ -571,6 +582,20 @@ const EXPECTED_SCHEMA = {
     { name: "CapAmount",  type: "number" },
     { name: "IsActive",   type: "boolean" },
     { name: "Notes",      type: "note" }
+  ]},
+  /* One row per message. Written by the app, sent and stamped by the flow. */
+  notifications: { title: LIST_TITLES.notifications, kind: "list", optional: true, columns: [
+    { name: "RunKey",       type: "text" },
+    { name: "Adviser",      type: "text" },
+    { name: "ToEmail",      type: "text" },
+    { name: "CcEmail",      type: "text" },
+    { name: "Kind",         type: "choice", choices: NOTIFY_KINDS },
+    { name: "Message",      type: "note" },
+    { name: "NeedsCheck",   type: "boolean" },
+    { name: "CheckSummary", type: "note" },
+    { name: "DueAt",        type: "dateTime" },
+    { name: "NotifyStatus", type: "choice", choices: NOTIFY_STATUS },
+    { name: "SentAt",       type: "dateTime" }
   ]},
   advisers: { title: LIST_TITLES.advisers, kind: "list", columns: [
     { name: "AccessRole",  type: "choice", choices: ROLES },
@@ -1256,13 +1281,16 @@ async function spResolve() {
   const site = await graph("/sites/" + CONFIG.sitePath + "?$select=id");
   sp.siteId = site.id;
   const lists = (await graph("/sites/" + sp.siteId + "/lists?$select=id,name,displayName")).value || [];
-  const find = title => {
+  const find = (title, optional) => {
     const hit = lists.find(l => normTitle(l.displayName) === normTitle(title))
              || lists.find(l => normTitle(l.name) === normTitle(title));
-    if (!hit) throw new Error('The list "' + title + '" was not found on the site. Settings → Check lists says exactly what is missing.');
-    return hit;
+    if (!hit && !optional) throw new Error('The list "' + title + '" was not found on the site. Settings → Check lists says exactly what is missing.');
+    return hit || null;
   };
-  for (const k of Object.keys(LIST_TITLES)) sp.lists[k] = find(LIST_TITLES[k]).id;
+  for (const k of Object.keys(LIST_TITLES)) {
+    const hit = find(LIST_TITLES[k], OPTIONAL_LISTS.includes(k));
+    sp.lists[k] = hit ? hit.id : null;
+  }
   const lib = find(DOC_LIBRARY);
   sp.driveId = (await graph("/sites/" + sp.siteId + "/lists/" + lib.id + "/drive?$select=id")).id;
 }
@@ -1638,6 +1666,190 @@ async function writeRun() {
   }
 }
 
+/* =========================================================================
+   Notifications
+
+   Rows, not emails. The app decides what should be said and to whom; a flow
+   decides how it reads and actually sends it. Writing the reminder at the same
+   moment as the invitation is what keeps the waiting visible — it is a row in
+   a list with a date on it, not something a flow has to remember.
+   ========================================================================= */
+
+const adviserRow = name => state.advisers.find(a => a.name === name) || null;
+const adviserEmail = name => { const a = adviserRow(name); return (a && a.email) || ""; };
+
+/* A Manager whose region matches the adviser's. Several is fine — they all get
+   it. None is not an error; the message still goes to the adviser. */
+function regionalManagersFor(adviserName) {
+  const a = adviserRow(adviserName);
+  const region = a && a.region;
+  if (!region || region === "—") return [];
+  return state.advisers.filter(x =>
+    x.active !== false && x.role === "Manager" && x.email && x.region === region);
+}
+
+/* The same three tests the Approvals screen shows, so the screen and the email
+   can never disagree about whether a book needs looking at. */
+function checkSummaryFor(adviser) {
+  const ms = (state.calc ? state.calc.masters : []).filter(m => m.adviser === adviser);
+  const att = attentionFor(ms);
+  return { needsCheck: att.total > 0,
+           summary: att.total ? att.parts.map(p => p.label).join(", ") : "Nothing flagged." };
+}
+
+function notifyRow(o) {
+  return {
+    Title: o.run + " · " + o.kind + " · " + (o.adviser || ""),
+    RunKey: o.run, Adviser: o.adviser || "",
+    ToEmail: o.to || "", CcEmail: o.cc || "",
+    Kind: o.kind, Message: o.message || "",
+    NeedsCheck: !!o.needsCheck, CheckSummary: o.checkSummary || "",
+    DueAt: o.dueAt || null,
+    NotifyStatus: o.status || "Queued"
+  };
+}
+
+/* Reads what is already queued for a run so pressing "Open for review" twice
+   does not send everybody two invitations. */
+async function existingNotifications(runKey) {
+  if (!sp.lists.notifications) return [];
+  const items = await spItems("notifications");
+  return items.map(i => i.fields || {}).filter(f => String(f.RunKey || "") === runKey);
+}
+
+async function sendNotifications(rows, { note } = {}) {
+  if (localMode() || !rows.length) return 0;
+  if (!sp.lists.notifications) {
+    toast("The " + LIST_TITLES.notifications + " list does not exist yet, so nothing was queued.", "bad");
+    return 0;
+  }
+  let n = 0;
+  for (const r of rows) {
+    try { await spCreate("notifications", r); n++; }
+    catch (e) { toast("Could not queue a message to " + (r.ToEmail || r.Adviser) + ". " + ((e && e.message) || e), "bad"); }
+  }
+  if (n && note) toast(note.replace("{n}", n), "good");
+  return n;
+}
+
+/* Opening a run invites every adviser who has clients in it, and schedules the
+   chase at the same time. Advisers with no email address in the directory are
+   named rather than skipped in silence. */
+async function notifyRunOpened(run) {
+  if (localMode() || !state.calc) return;
+  const advisers = [...new Set(state.calc.masters.map(m => m.adviser))].filter(Boolean).sort();
+  const already = await existingNotifications(run.key);
+  const has = (adviser, kind) => already.some(f => f.Adviser === adviser && f.Kind === kind);
+  const due = new Date(Date.now() + REMINDER_DAYS * 86400000).toISOString();
+  const rows = [];
+  const noEmail = [];
+
+  for (const a of advisers) {
+    const to = adviserEmail(a);
+    if (!to) { noEmail.push(a); continue; }
+    const n = state.calc.masters.filter(m => m.adviser === a).length;
+    const what = n + " client" + (n === 1 ? "" : "s") + " to review for " + monthLabel(run.key);
+    if (!has(a, "Review ready")) {
+      rows.push(notifyRow({ run: run.key, adviser: a, to, kind: "Review ready", status: "Queued",
+        message: what + "." }));
+    }
+    if (!has(a, "Reminder")) {
+      rows.push(notifyRow({ run: run.key, adviser: a, to, kind: "Reminder", status: "Scheduled", dueAt: due,
+        cc: regionalManagersFor(a).map(m => m.email).join(";"),
+        message: what + ", still outstanding after " + REMINDER_DAYS + " days." }));
+    }
+  }
+  const sent = await sendNotifications(rows);
+  return { queued: sent, advisers: advisers.length, noEmail,
+           alreadyHad: advisers.length - noEmail.length - (rows.length / 2) };
+}
+
+/* Says what actually happened, at length, because the failure that matters here
+   is the silent one: every adviser missing an email address means zero rows
+   written and nothing to show for a button press. */
+function reportNotifyResult(res) {
+  if (!res) return;
+  if (res.noEmail.length) {
+    alert(res.noEmail.length + " of " + res.advisers + " advisers have no email address in " +
+      LIST_TITLES.advisers + ", so nothing was sent to them:\n\n" + res.noEmail.join("\n") +
+      "\n\nThe name here must match their Xplan name exactly — that is what links a row in the " +
+      "directory to the clients in the extract. Fix the directory, then press Notify advisers again." +
+      (res.queued ? "\n\n" + res.queued + " messages were queued for the others." : ""));
+    return;
+  }
+  if (!res.queued) {
+    toast("Every adviser already had their invitation — nothing new to queue.");
+    return;
+  }
+  toast(res.queued + " messages queued for " + (res.advisers - res.noEmail.length) + " advisers.", "good");
+}
+
+/* Submitting tells the regional manager, and says whether the book needs an
+   eye on it. The scheduled reminder is left alone — the daily flow checks the
+   adviser's status when it comes due and cancels itself. */
+async function notifySubmitted(run, adviser) {
+  if (localMode()) return;
+  const mgrs = regionalManagersFor(adviser);
+  if (!mgrs.length) return;
+  const chk = checkSummaryFor(adviser);
+  const ms = (state.calc ? state.calc.masters : []).filter(m => m.adviser === adviser);
+  const cur = ms.reduce((a, m) => a + (m.currentFee || 0), 0);
+  const nw = ms.reduce((a, m) => a + (m.fee || 0), 0);
+  await sendNotifications([notifyRow({
+    run: run.key, adviser, kind: "Completed", status: "Queued",
+    to: mgrs.map(m => m.email).join(";"),
+    needsCheck: chk.needsCheck, checkSummary: chk.summary,
+    message: adviser + " has completed " + monthLabel(run.key) + ". " + ms.length +
+      " clients, " + money(cur) + " → " + money(nw) + " (" + signed(nw - cur) + "). " +
+      (chk.needsCheck ? "Needs a look: " + chk.summary : "Nothing flagged.")
+  })]);
+}
+
+/* Sent back. This is the one an adviser most needs to hear about — their work
+   is read-only until they act, and if they had already submitted then their
+   scheduled reminder was cancelled, so nothing else would reach them. The
+   manager's note is the whole point of the message, so it is carried verbatim
+   rather than summarised. */
+async function notifyReturned(run, adviser, note) {
+  if (localMode()) return;
+  const to = adviserEmail(adviser);
+  if (!to) { toast(adviser + " has no email in the directory, so they were not told.", "bad"); return; }
+  const clean = String(note || "").trim();
+  await sendNotifications([notifyRow({
+    run: run.key, adviser, to, kind: "Returned", status: "Queued",
+    cc: regionalManagersFor(adviser).map(m => m.email).join(";"),
+    message: "Your " + monthLabel(run.key) + " fee review has been sent back and needs another look." +
+      (clean ? "\n\nWhat needs changing:\n" + clean : "")
+  })], { note: adviser + " has been emailed." });
+}
+
+async function notifyApproved(run, adviser) {
+  if (localMode()) return;
+  const to = adviserEmail(adviser);
+  if (!to) return;
+  await sendNotifications([notifyRow({
+    run: run.key, adviser, to, kind: "Approved", status: "Queued",
+    message: "Your " + monthLabel(run.key) + " fee review has been approved. Nothing further needed."
+  })]);
+}
+
+/* The manual chase. Deliberate, pressed by a person, and the only thing that
+   reaches an adviser whose work was sent back after they had already submitted
+   — their scheduled reminder is long gone by then. */
+async function notifyReminder(run, adviser) {
+  const to = adviserEmail(adviser);
+  if (!to) { toast(adviser + " has no email address in the directory.", "bad"); return; }
+  const st = adviserState(adviser).status;
+  const n = (state.calc ? state.calc.masters : []).filter(m => m.adviser === adviser).length;
+  await sendNotifications([notifyRow({
+    run: run.key, adviser, to, kind: "Reminder", status: "Queued",
+    cc: regionalManagersFor(adviser).map(m => m.email).join(";"),
+    message: (st === "Returned"
+      ? "Your " + monthLabel(run.key) + " review has been sent back and needs another look."
+      : n + " client" + (n === 1 ? "" : "s") + " still to review for " + monthLabel(run.key) + ".")
+  })], { note: "Reminder queued for " + adviser + "." });
+}
+
 /* What a locked month leaves behind.
 
    Rollups only — totals, and a line per adviser, per region, per category.
@@ -1879,7 +2091,13 @@ async function checkConnection() {
       || lists.find(l => norm(l.name) === norm(spec.title));
 
     if (!hit) {
-      row.findings.push({ level: "bad", column: "", text: "not found on the site. Check the name is exactly \"" + spec.title + "\"." });
+      /* An optional list is a feature that is not switched on yet, not a
+         fault. Saying "to fix" about the notification list before anybody has
+         built it sends people hunting for a problem they do not have. */
+      row.optional = !!spec.optional;
+      row.findings.push(spec.optional
+        ? { level: "warn", column: "", text: "not built yet, so notifications are not queued. Everything else works without it." }
+        : { level: "bad", column: "", text: "not found on the site. Check the name is exactly \"" + spec.title + "\"." });
       report.lists.push(row);
       continue;
     }
@@ -1903,7 +2121,8 @@ async function checkConnection() {
     report.lists.push(row);
   }
 
-  report.ok = report.lists.every(l => l.found && !l.findings.some(f => f.level === "bad"));
+  report.ok = report.lists.every(l =>
+    (l.found || l.optional) && !l.findings.some(f => f.level === "bad"));
   return report;
 }
 
@@ -3088,7 +3307,17 @@ function renderTopActions() {
   $("#topActions").querySelectorAll("[data-role]").forEach(b =>
     b.addEventListener("click", () => { state.role = b.dataset.role; state.expanded = {}; saveUi(); render(); }));
   const setStatus = s => { const r = currentRun(); if (r) { r.status = s; saveRuns(); render(); toast("Run is now " + s + ".", "good"); } };
-  if ($("#btnOpen")) $("#btnOpen").addEventListener("click", () => setStatus("Open for Review"));
+  if ($("#btnOpen")) $("#btnOpen").addEventListener("click", async () => {
+    const r = currentRun();
+    if (!r) return;
+    const advisers = new Set((state.calc ? state.calc.masters : []).map(m => m.adviser).filter(Boolean));
+    if (!localMode() && advisers.size && !confirm(
+      "Open " + monthLabel(r.key) + " for review?\n\n" + advisers.size +
+      " adviser" + (advisers.size === 1 ? "" : "s") + " will be emailed now, and chased in " +
+      REMINDER_DAYS + " days if they have not finished.")) return;
+    setStatus("Open for Review");
+    reportNotifyResult(await notifyRunOpened(r));
+  });
   if ($("#btnLock")) $("#btnLock").addEventListener("click", () => {
     const c = state.calc;
     const outstanding = [...new Set(c.masters.map(m => m.adviser))]
@@ -3866,7 +4095,14 @@ function viewApprovals() {
 
   html += '<div class="card"><div class="card-h"><h2>Adviser sign-off</h2>' +
     '<div class="sub">Click an adviser to see their book without leaving this screen</div>' +
-    '<div class="right no-print"><button class="btn ghost" id="btnRemindAll">Copy chase list</button></div></div>' +
+    '<div class="right no-print">' +
+    /* The recovery path. Opening a run queues the invitations once, and if the
+       directory was wrong at that moment nothing was written and the button
+       that would have done it is gone. This re-runs it for anybody still
+       without one, and is safe to press repeatedly. */
+    (run.status === "Open for Review" && can("approve") && !localMode()
+      ? '<button class="btn ghost" id="btnNotify">Notify advisers</button>' : "") +
+    '<button class="btn ghost" id="btnRemindAll">Copy chase list</button></div></div>' +
     '<div class="tbl-wrap"><table><thead><tr><th></th><th>Adviser</th><th>Region</th><th class="num">Clients</th>' +
     '<th class="num">Total FUM</th><th class="num">Current</th><th class="num">New</th><th class="num">Movement</th>' +
     '<th>Needs a look</th><th>Status</th><th class="no-print"></th></tr></thead><tbody>';
@@ -3897,11 +4133,13 @@ function viewApprovals() {
           ? '<button class="btn btn-sm" data-appr="' + esc(a) + '">Approve</button> ' +
             '<button class="btn ghost btn-sm" data-ret="' + esc(a) + '">Return</button>'
           : '<button class="btn ghost btn-sm" data-sub="' + esc(a) + '">Mark submitted</button>') +
-        /* Deliberately inert until the notification queue and the Power Automate
-           flow exist. Shown now so the shape of the screen is settled and the
-           team can see where it will land. */
-        (st.status === "Not started" || st.status === "In progress"
-          ? ' <button class="btn ghost btn-sm" disabled title="Available once the reminder flow is live. Until then, Copy chase list.">Send reminder</button>'
+        /* Anyone who is not finished can be chased by hand. This is also the
+           only thing that reaches someone whose work was sent back after they
+           had submitted — their scheduled reminder is gone by then. */
+        (["Not started", "In progress", "Returned"].includes(st.status)
+          ? ' <button class="btn ghost btn-sm" data-remind="' + esc(a) + '"' +
+            (localMode() ? " disabled title=\"Needs a connection — local mode sends nothing.\"" : "") +
+            ">Send reminder</button>"
           : "") +
       "</td></tr>";
 
@@ -4398,7 +4636,7 @@ function renderConnReport(report) {
 
   html += '<div class="banner ' + (report.ok ? "info" : "bad") + '">' +
     (report.ok
-      ? "<strong>All five match.</strong> Site: " + esc(report.site.name) + ". Nothing to fix."
+      ? "<strong>Everything matches.</strong> Site: " + esc(report.site.name) + ". Nothing to fix."
       : "<strong>Some lists need attention.</strong> Site: " + esc(report.site.name) + ". Everything below is exactly what to change.") +
     "</div>";
 
@@ -4406,8 +4644,12 @@ function renderConnReport(report) {
   for (const l of report.lists) {
     const bad = l.findings.filter(f => f.level === "bad").length;
     const warn = l.findings.filter(f => f.level === "warn").length;
-    const pill = !l.found || bad ? "bad" : warn ? "warn" : "ok";
-    const label = !l.found ? "not found" : bad ? bad + " to fix" : warn ? warn + " to check" : "ok";
+    /* A list that is optional and absent is a feature not switched on, not a
+       fault. Red on that row sends somebody hunting for a problem. */
+    const missingOk = !l.found && l.optional;
+    const pill = missingOk ? "warn" : (!l.found || bad) ? "bad" : warn ? "warn" : "ok";
+    const label = missingOk ? "not built yet"
+      : !l.found ? "not found" : bad ? bad + " to fix" : warn ? warn + " to check" : "ok";
     html += "<tr><td><strong>" + esc(l.title) + '</strong><div class="small muted">' + esc(l.kind) +
       (l.aka ? ' &middot; on the site as "' + esc(l.aka) + '"' : "") + "</div></td>" +
       '<td class="num">' + (l.columnCount == null ? "—" : l.columnCount) + "</td>" +
@@ -4578,27 +4820,48 @@ function wire() {
   }
   if ($("#btnCsv")) $("#btnCsv").addEventListener("click", exportCsv);
   if ($("#btnPrint")) $("#btnPrint").addEventListener("click", openPrintDialog);
-  if ($("#btnSubmit")) $("#btnSubmit").addEventListener("click", () => {
+  if ($("#btnSubmit")) $("#btnSubmit").addEventListener("click", async () => {
     const me = scopedAdviser();
     if (!me) return;
     if (!confirm("Submit your " + monthLabel(state.runKey) + " clients for approval? They become read-only until approved or sent back.")) return;
     setAdviserStatus(me, "Submitted");
     toast("Submitted for approval.", "good");
     render();
+    await notifySubmitted(currentRun(), me);
   });
 
   /* --- approvals --- */
   document.querySelectorAll("[data-appr]").forEach(el =>
-    el.addEventListener("click", () => { setAdviserStatus(el.dataset.appr, "Approved"); render(); toast(el.dataset.appr + " approved.", "good"); }));
+    el.addEventListener("click", async () => {
+      setAdviserStatus(el.dataset.appr, "Approved");
+      render();
+      toast(el.dataset.appr + " approved.", "good");
+      await notifyApproved(currentRun(), el.dataset.appr);
+    }));
   document.querySelectorAll("[data-ret]").forEach(el =>
-    el.addEventListener("click", () => {
-      const note = prompt("What needs changing? (shown to the adviser)");
+    el.addEventListener("click", async () => {
+      const note = prompt("What needs changing? (emailed to the adviser, and shown on their screen)");
       if (note === null) return;
       setAdviserStatus(el.dataset.ret, "Returned", note);
       render();
+      await notifyReturned(currentRun(), el.dataset.ret, note);
     }));
   document.querySelectorAll("[data-sub]").forEach(el =>
     el.addEventListener("click", () => { setAdviserStatus(el.dataset.sub, "Submitted"); render(); }));
+  document.querySelectorAll("[data-remind]").forEach(el =>
+    el.addEventListener("click", async () => {
+      const who = el.dataset.remind;
+      if (!confirm("Email a reminder to " + who + "?" +
+        (regionalManagersFor(who).length ? "\n\nTheir regional manager is copied in." : ""))) return;
+      await notifyReminder(currentRun(), who);
+    }));
+  if ($("#btnNotify")) $("#btnNotify").addEventListener("click", async () => {
+    const r = currentRun();
+    if (!r) return;
+    if (!confirm("Queue the review invitation for any adviser who has not had one for " +
+      monthLabel(r.key) + "?\n\nAnyone already invited is skipped, so this is safe to press more than once.")) return;
+    reportNotifyResult(await notifyRunOpened(r));
+  });
   if ($("#btnRemindAll")) $("#btnRemindAll").addEventListener("click", () => {
     const c = state.calc;
     const outstanding = [...new Set(c.masters.map(m => m.adviser))].filter(a => a && adviserState(a).status !== "Approved");
