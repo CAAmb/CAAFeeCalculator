@@ -8,7 +8,7 @@
 <!-- Content Security Policy. Nothing is fetched from a CDN at runtime: the XLSX
      reader is hand-rolled against the browser's own DecompressionStream, so the
      only remote origins here are the ones Microsoft sign-in will need in phase 2. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://graph.microsoft.com https://login.microsoftonline.com; frame-src 'self' https://login.microsoftonline.com; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://graph.microsoft.com https://login.microsoftonline.com https://coastaladvicegroup.sharepoint.com; frame-src 'self' https://login.microsoftonline.com; base-uri 'none'; form-action 'none'">
 <script>
 /* Clickjacking guard, matching the other Coastal apps. MSAL's silent-renewal
    iframe loads this page to hand a token back, so leave that one framed. */
@@ -1229,6 +1229,8 @@ function explainAuthError(e) {
     return "Your account isn't assigned to the application. Either assign it in Entra → Enterprise " +
       "applications → Users and groups, or turn off <em>Assignment required</em>.";
   }
+  const blocked = explainFetchFailure(e);
+  if (blocked) return blocked;
   return esc(msg);
 }
 
@@ -1314,6 +1316,15 @@ async function spPutFile(path, text) {
   return res.json();
 }
 
+/* Graph does not hand back file content: it answers /content with a 302 to a
+   pre-authenticated SharePoint URL, and fetch follows it. That redirected
+   request has to satisfy the page's CSP as well, so the tenant's SharePoint
+   origin is in connect-src at the top of this file. Without it the browser
+   blocks the redirect and fetch rejects with a bare "Failed to fetch" that
+   names nothing — the console does, but the app cannot see it.
+
+   Uploading has no such problem: a PUT under 4MB is handled by Graph directly.
+   So this fails only on read, and only once a run exists to read. */
 async function spGetFile(path) {
   const token = await getToken(false);
   const res = await fetch("https://graph.microsoft.com/v1.0/drives/" + sp.driveId +
@@ -1321,6 +1332,20 @@ async function spGetFile(path) {
   if (res.status === 404) return null;
   if (!res.ok) throw new Error("Could not read the extract (" + res.status + " " + res.statusText + ").");
   return res.json();
+}
+
+/* "Failed to fetch" is what a CSP-blocked request looks like from inside the
+   page, and it says nothing about which request or why. Since the one thing
+   that can produce it here is the SharePoint redirect above, say so rather
+   than passing the browser's word along. */
+function explainFetchFailure(e) {
+  const msg = String((e && e.message) || e || "");
+  if (!/failed to fetch|networkerror|load failed/i.test(msg)) return "";
+  const host = "https://" + CONFIG.sitePath.split(":")[0];
+  return "The browser blocked a request before it was sent. Reading the monthly extract " +
+    "redirects to <code>" + esc(host) + "</code>, so that address has to be listed in this page's " +
+    "<code>connect-src</code> Content-Security-Policy — check the <code>&lt;meta&gt;</code> tag at the top of " +
+    "<code>index.html</code>. The browser console names the exact address it blocked.";
 }
 
 /* ---- shapes: list row <-> the objects the app already works in ---- */
