@@ -170,7 +170,18 @@ h1,h2,h3{font-weight:500;margin:0}
   color:var(--side-ink);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:hidden}
 .brand{padding:24px 18px 18px;display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;border-bottom:1px solid var(--side-rule)}
 .brand-logo-img{width:86%;max-width:184px;height:auto;display:block;filter:var(--logo-filter)}
-.brand-sub{color:var(--side-ink-dim);font-size:.7rem;letter-spacing:.18em;text-transform:uppercase}
+/* The pill. Solid peach with navy on it, the same pairing the avatar already
+   uses, so it reads as part of the brand rather than a sticker. A single fill
+   works in both themes because --peach and --navy are fixed: it sits on near
+   black at the top of the dark sidebar and on pale blue in the light one, and
+   carries navy text comfortably either way.
+
+   Long enough to need two lines if the wording grows, so it wraps inside
+   itself and stays centred rather than stretching the brand block. */
+.brand-sub{display:inline-block;max-width:100%;background:var(--peach);color:var(--navy);
+  font-size:.56rem;font-weight:700;letter-spacing:.15em;line-height:1.5;text-transform:uppercase;
+  text-align:center;padding:5px 13px;border-radius:var(--r-pill);
+  box-shadow:0 1px 4px rgba(0,0,0,.18)}
 nav{padding:12px;display:flex;flex-direction:column;gap:2px;flex:1;overflow:auto}
 .nav-sec{font-size:.62rem;letter-spacing:.16em;text-transform:uppercase;color:var(--side-ink-dim);padding:14px 12px 5px}
 .nav-btn{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--r-sm);background:transparent;border:0;
@@ -269,6 +280,34 @@ tbody tr.acct:hover td{background:var(--row-hover-2)}
 /* For a table inside a card body rather than filling one: scrolls sideways if
    it has to, instead of pushing its own card open and spilling over the edge. */
 .tbl-scroll{overflow-x:auto;max-width:100%}
+
+/* ---------------------------------------------------------------------------
+   The sign-in screen.
+   Nothing of the application is drawn yet, so it gets the whole window rather
+   than a card floating inside empty app chrome. The brand gradient is the same
+   one the sidebar wears, so signing in and being signed in feel like the same
+   product.
+   --------------------------------------------------------------------------- */
+body.gate #sidebar, body.gate header.top, body.gate #demoBar{display:none !important}
+body.gate #main{background-image:var(--side-img);background-size:cover;background-position:center}
+body.gate main.page{display:grid;place-items:center;padding:24px;min-height:100vh}
+
+.gate-card{width:min(420px,100%);background:var(--surface-glass);border:1px solid var(--line);
+  border-radius:var(--r-lg);box-shadow:var(--shadow-lift);padding:36px 34px 30px;text-align:center;
+  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%)}
+.gate-card .mark{width:150px;max-width:64%;height:auto;margin:0 auto 22px;display:block;filter:var(--logo-filter)}
+.gate-card h2{font-size:1.3rem;margin-bottom:8px;letter-spacing:-.01em}
+.gate-card .lead{color:var(--ink-2);font-size:.88rem;line-height:1.55;margin-bottom:22px}
+.gate-card .btn{width:100%;padding:12px 18px;font-size:.78rem}
+.gate-card .foot{margin-top:20px;padding-top:16px;border-top:1px solid var(--line);
+  font-size:.72rem;color:var(--ink-muted);word-break:break-word}
+.gate-card .banner{text-align:left;margin:0 0 18px}
+.gate-card .kv{text-align:left;margin-bottom:18px}
+/* A spinner rather than a static word, so a slow tenant does not look stuck. */
+.gate-spin{width:26px;height:26px;margin:0 auto 18px;border-radius:50%;
+  border:2.5px solid var(--line-strong);border-top-color:var(--s1);animation:gspin .7s linear infinite}
+@keyframes gspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.gate-spin{animation:none}}
 
 /* Deliberately loud, and deliberately not dismissible. */
 .demo-bar{background:var(--warn-bg);color:var(--warn-fg);border-bottom:1px solid var(--warn-line);
@@ -437,7 +476,7 @@ td input.num{text-align:right}
   <aside id="sidebar">
     <div class="brand">
       <img class="brand-logo-img" src="CAA_White.png" alt="Coastal Advisory">
-      <div class="brand-sub">Fee Calculator</div>
+      <div class="brand-sub">The Amazing Fee Calculator</div>
     </div>
     <nav id="nav"></nav>
     <div class="side-foot">
@@ -1703,6 +1742,23 @@ async function writeRun() {
 const adviserRow = name => state.advisers.find(a => a.name === name) || null;
 const adviserEmail = name => { const a = adviserRow(name); return (a && a.email) || ""; };
 
+/* Xplan files people surname-first — "Aldridge, Petra" — so the given name is
+   whatever follows the comma. A directory row typed the other way round still
+   works: without a comma, take the first word. A middle name is dropped either
+   way, since "Hi Petra Jane," is not how anybody writes to a colleague. */
+function firstNameOf(name) {
+  const s = String(name || "").trim();
+  if (!s) return "";
+  const given = s.includes(",") ? s.slice(s.indexOf(",") + 1) : s;
+  return given.trim().split(/\s+/)[0] || "";
+}
+
+/* Nothing at all rather than "Hi ," if the name is unusable. */
+const greeting = name => {
+  const f = firstNameOf(name);
+  return f ? "Hi " + f + ",\n\n" : "";
+};
+
 /* A Manager whose region matches the adviser's. Several is fine — they all get
    it. None is not an error; the message still goes to the adviser. */
 function regionalManagersFor(adviserName) {
@@ -1776,12 +1832,12 @@ async function notifyRunOpened(run) {
     const what = n + " client" + (n === 1 ? "" : "s") + " to review for " + monthLabel(run.key);
     if (!has(a, "Review ready")) {
       rows.push(notifyRow({ run: run.key, adviser: a, to, kind: "Review ready", status: "Queued",
-        message: what + "." }));
+        message: greeting(a) + what + ".\n\nThis is due within " + REMINDER_DAYS + " days." }));
     }
     if (!has(a, "Reminder")) {
       rows.push(notifyRow({ run: run.key, adviser: a, to, kind: "Reminder", status: "Scheduled", dueAt: due,
         cc: regionalManagersFor(a).map(m => m.email).join(";"),
-        message: what + ", still outstanding after " + REMINDER_DAYS + " days." }));
+        message: greeting(a) + what + ", still outstanding after " + REMINDER_DAYS + " days." }));
     }
   }
   const sent = await sendNotifications(rows);
@@ -1824,8 +1880,13 @@ async function notifySubmitted(run, adviser) {
     run: run.key, adviser, kind: "Completed", status: "Queued",
     to: mgrs.map(m => m.email).join(";"),
     needsCheck: chk.needsCheck, checkSummary: chk.summary,
-    message: adviser + " has completed " + monthLabel(run.key) + ". " + ms.length +
-      " clients, " + money(cur) + " → " + money(nw) + " (" + signed(nw - cur) + "). " +
+    /* A line each, because this is the one message somebody skims to decide
+       whether to open the run at all. */
+    message: adviser + " has completed " + monthLabel(run.key) + ".\n\n" +
+      "Clients: " + ms.length + "\n" +
+      "Current fees: " + money(cur) + "\n" +
+      "New fees: " + money(nw) + "\n" +
+      "Movement: " + signed(nw - cur) + "\n\n" +
       (chk.needsCheck ? "Needs a look: " + chk.summary : "Nothing flagged.")
   })]);
 }
@@ -1842,8 +1903,10 @@ async function notifyReturned(run, adviser, note) {
   const clean = String(note || "").trim();
   await sendNotifications([notifyRow({
     run: run.key, adviser, to, kind: "Returned", status: "Queued",
-    cc: regionalManagersFor(adviser).map(m => m.email).join(";"),
-    message: "Your " + monthLabel(run.key) + " fee review has been sent back and needs another look." +
+    /* No CC. Whoever sent it back is the one who would have been copied, and
+       an email telling you what you just did is noise. */
+    message: greeting(adviser) +
+      "Your " + monthLabel(run.key) + " fee review has been sent back and needs another look." +
       (clean ? "\n\nWhat needs changing:\n" + clean : "")
   })], { note: adviser + " has been emailed." });
 }
@@ -1869,9 +1932,10 @@ async function notifyReminder(run, adviser) {
   await sendNotifications([notifyRow({
     run: run.key, adviser, to, kind: "Reminder", status: "Queued",
     cc: regionalManagersFor(adviser).map(m => m.email).join(";"),
-    message: (st === "Returned"
+    message: greeting(adviser) + (st === "Returned"
       ? "Your " + monthLabel(run.key) + " review has been sent back and needs another look."
-      : n + " client" + (n === 1 ? "" : "s") + " still to review for " + monthLabel(run.key) + ".")
+      : n + " client" + (n === 1 ? "" : "s") + " still to review for " + monthLabel(run.key) + ".") +
+      "\n\nPlease complete as soon as possible."
   })], { note: "Reminder queued for " + adviser + "." });
 }
 
@@ -3155,6 +3219,7 @@ async function startSession() {
    straight into #page with the nav empty, so there is nothing to click past. */
 function renderGate() {
   const id = state.identity;
+  document.body.classList.add("gate");
   $("#pgTitle").textContent = "CAA Fee Calculator";
   $("#pgSub").textContent = CONFIG.sitePath.split(":/").pop();
   $("#nav").innerHTML = "";
@@ -3164,20 +3229,24 @@ function renderGate() {
   $("#whoRole").textContent = id ? id.email : "";
   $("#whoAvatar").textContent = id ? initials(id.name) : "?";
 
-  const card = b => '<div class="card" style="max-width:620px;margin:40px auto"><div class="card-b" style="padding:32px">' + b + "</div></div>";
+  /* The brand mark, then whatever this particular state needs to say. Same
+     shell every time so the screen does not jump between states. */
+  const card = b => '<div class="gate-card">' +
+    '<img class="mark" src="' + logoSrc() + '" alt="Coastal Advisory Australia">' + b +
+    '<div class="foot">' + esc(CONFIG.sitePath.split(":/").pop()) + "</div></div>";
   let html = "";
 
   if (state.authState === "signing-in") {
-    html = card('<h2 style="margin-bottom:8px">Signing in…</h2>' +
-      '<div class="muted">Checking who you are against the adviser directory. ' +
+    html = card('<div class="gate-spin"></div><h2>Signing you in</h2>' +
+      '<div class="lead">Checking who you are against the adviser directory. ' +
       "If a Microsoft sign-in page opens, that is this app asking.</div>");
   } else if (state.authState === "loading") {
-    html = card('<h2 style="margin-bottom:8px">Loading…</h2>' +
-      '<div class="muted">Reading the rate card, the fund table and this month\'s run from SharePoint. ' +
-      "Client data is never kept on this machine, so it is fetched fresh each time.</div>");
+    html = card('<div class="gate-spin"></div><h2>Loading</h2>' +
+      '<div class="lead">Reading the rate card, the fund table and this month\'s run. ' +
+      "Client data is never kept on this machine, so it comes fresh every time.</div>");
   } else if (state.authState === "error") {
-    html = card('<h2 style="margin-bottom:10px">Could not sign in</h2>' +
-      '<div class="banner bad" style="margin:0 0 14px">' + state.authError + "</div>" +
+    html = card("<h2>Could not sign in</h2>" +
+      '<div class="banner bad">' + state.authError + "</div>" +
       '<button class="btn sky" id="btnRetryAuth">Try again</button>');
   } else if (state.authState === "denied" && id) {
     /* Being turned away is the common case on day one, so it says exactly what
@@ -3190,19 +3259,20 @@ function renderGate() {
         ? "Your row has an AccessRole of <strong>" + esc(id.row.AccessRole) + "</strong>, which is not one of " +
           ROLES.join(", ") + "."
         : "There is no row for you in the <strong>" + esc(LIST_TITLES.advisers) + "</strong> list.";
-    html = card('<h2 style="margin-bottom:10px">You don\'t have access yet</h2>' +
-      '<div class="banner warn" style="margin:0 0 14px">' + why + "</div>" +
-      '<div class="kv" style="margin-bottom:16px"><div class="k">Signed in as</div><div class="v">' + esc(id.name) + "</div>" +
+    html = card("<h2>You don't have access yet</h2>" +
+      '<div class="banner warn">' + why + "</div>" +
+      '<div class="kv"><div class="k">Signed in as</div><div class="v">' + esc(id.name) + "</div>" +
       '<div class="k">Email</div><div class="v mono">' + esc(id.email) + "</div>" +
       '<div class="k">Directory rows</div><div class="v">' + id.rows + "</div></div>" +
-      '<div class="small muted">Ask an Admin to add you to <code>' + esc(LIST_TITLES.advisers) + '</code> with your ' +
-      "email in the <code>Email</code> column and a role in <code>AccessRole</code>. An adviser's <code>Title</code> " +
-      "must match their Xplan name exactly, or their clients will not find them.</div>" +
-      '<div class="spacer"></div><button class="btn ghost" id="btnRetryAuth">Check again</button>');
+      '<div class="lead" style="font-size:.78rem;text-align:left">Ask an Admin to add you to <code>' +
+      esc(LIST_TITLES.advisers) + "</code> with your email in the <code>Email</code> column and a role in " +
+      "<code>AccessRole</code>. An adviser's <code>Title</code> must match their Xplan name exactly, or their " +
+      "clients will not find them.</div>" +
+      '<button class="btn ghost" id="btnRetryAuth">Check again</button>');
   } else {
-    html = card('<h2 style="margin-bottom:8px">Sign in to continue</h2>' +
-      '<div class="muted" style="margin-bottom:18px">The fee calculator reads its pricing, its people and its runs ' +
-      "from SharePoint, so it needs to know who you are.</div>" +
+    html = card("<h2>Fee Calculator</h2>" +
+      '<div class="lead">The monthly adviser fee review. Pricing, people and runs all live in ' +
+      "SharePoint, so it needs to know who you are.</div>" +
       '<button class="btn sky" id="btnSignIn">Sign in with Microsoft</button>');
   }
 
@@ -3215,6 +3285,7 @@ function renderGate() {
 function render() {
   /* Connected and not yet through the gate: nothing of the app is drawn. */
   if (!localMode() && state.authState !== "ready") { renderGate(); return; }
+  document.body.classList.remove("gate");
   recalc();
 
   /* Nobody may be left standing on a screen their role cannot open, and an
