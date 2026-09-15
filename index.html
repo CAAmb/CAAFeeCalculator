@@ -375,6 +375,15 @@ td input.num{text-align:right}
 .nowrap{white-space:nowrap}
 .spacer{height:16px}
 
+/* A figure and its label on one line, for the pricing calculator's running
+   totals. The last one in a run is the answer, so it is given the weight. */
+.result-line{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  padding:7px 0;border-bottom:1px solid var(--line);font-size:.88rem}
+.result-line:last-of-type{border-bottom:0}
+.result-line strong{font-size:.95rem}
+.result-line .mono{font-variant-numeric:tabular-nums}
+.result-line:has(strong){font-size:1rem}
+
 /* ---------------------------------------------------------------------------
    The report.
    Built into its own container rather than printed from the working screen: a
@@ -476,7 +485,7 @@ td input.num{text-align:right}
   <aside id="sidebar">
     <div class="brand">
       <img class="brand-logo-img" src="CAA_White.png" alt="Coastal Advisory">
-      <div class="brand-sub">The Amazing Fee Calculator</div>
+      <div class="brand-sub">The Amazing Fee Hub</div>
     </div>
     <nav id="nav"></nav>
     <div class="side-foot">
@@ -664,10 +673,49 @@ const EXPECTED_SCHEMA = {
 
    The only figure kept is the soft warning band, which is a UI tolerance rather
    than pricing. */
+/* ---------------- pricing calculator ----------------
+   The internal pricing sheet, as data. Same rule as the rate card: NOTHING REAL
+   LIVES HERE. This is the shape with no prices in it — Rate/Fee Settings fills
+   it in, and it travels inside the rate card so pricing has one home and the
+   site needs no seventh list.
+
+   A price of `null` means the line does not apply to that client type at all,
+   which is a different thing from a price of zero.
+
+   `kind` is what the line does, not what it costs:
+     min            applies once on its own, no quantity
+     each           multiplied by however many the adviser enters
+     hour           multiplied by hours
+   and `suppressesMin` marks an each-line that cancels its section's minimum —
+   an insurance-only engagement does not also carry the base SOA fee. */
+const PRICE_KINDS = ["min", "each", "hour"];
+
+const EMPTY_PRICING = {
+  reviewed: "",                       // "30 June 2026", shown on the screen
+  items: [],                          // { id, section, label, kind, newPrice, existingPrice, suppressesMin, note }
+  /* Marginal FUM bands, one ladder per client type, in the same {from, rate}
+     shape the surcharge bands use so surchargeFor() prices both. */
+  ladders: { NEW: [], EXISTING: [] },
+  /* Service tiers, chosen by total ongoing fee. `from` is the threshold; the
+     next package's threshold is the top of this one, so they cannot disagree.
+     cas/mtf are the Centrelink admin fees for a client on that package. */
+  packages: [],                       // { name, from, cas, mtf }
+  noCsa: { cas: 0, mtf: 0 },          // the same two fees for a client with no agreement
+  claims: {
+    tiers: [],                        // {from, rate} on the insured benefit
+    rates: [],                        // { label, hourly, ipMonthly }
+    multiDiscount: 0                  // 0.15 for the two-claims-one-insurer discount
+  },
+  reference: []                       // { title, body } — preferred insurers, Centrelink criteria
+};
+
 const EMPTY_RATE_CARD = {
   version: "",
   effectiveFrom: "",
   categories: [],
+  /* The internal pricing sheet — see EMPTY_PRICING. Kept with the rate card
+     because it is the same thing: what Coastal charges. */
+  pricing: JSON.parse(JSON.stringify(EMPTY_PRICING)),
   /* Xplan's Master Category codes were stamped under an older pricing table
      whose letters pointed at different tiers, so a code cannot be read literally
      — it has to be mapped deliberately. Empty means an unmapped category shows
@@ -777,10 +825,10 @@ const SAMPLE_RATE_CARD = {
    Admin exists at all, which would otherwise lock the first person out of their
    own site. */
 const CAN = {
-  Adviser: { ownBook: true },
-  Ops:     { run: true, approve: true, rateCard: true },
-  Manager: { run: true, approve: true, rateCard: true, rateCardEdit: true },
-  Admin:   { run: true, approve: true, rateCard: true, rateCardEdit: true, people: true, settings: true }
+  Adviser: { ownBook: true, pricing: true },
+  Ops:     { run: true, approve: true, rateCard: true, pricing: true },
+  Manager: { run: true, approve: true, rateCard: true, rateCardEdit: true, pricing: true },
+  Admin:   { run: true, approve: true, rateCard: true, rateCardEdit: true, pricing: true, people: true, settings: true }
 };
 const can = what => !!(CAN[state.role] || {})[what];
 
@@ -978,15 +1026,27 @@ const state = {
   saveError: ""
 };
 
+/* A card written by an earlier build will not have every key this one reads, so
+   fill the gaps from the seed rather than letting a missing key throw on boot.
+   A plain spread only reaches the top level — `pricing` is a nested object and
+   has to be merged in its own right, or a card saved before the pricing
+   calculator existed arrives with `pricing` undefined. */
+function hydrateCard(raw) {
+  const seed = JSON.parse(JSON.stringify(EMPTY_RATE_CARD));
+  if (!raw) return seed;
+  const p = raw.pricing || {};
+  return { ...seed, ...raw,
+    aliases: raw.aliases || {},
+    legacyRates: raw.legacyRates || {},
+    pricing: { ...seed.pricing, ...p,
+      ladders: { ...seed.pricing.ladders, ...(p.ladders || {}) },
+      noCsa:   { ...seed.pricing.noCsa,   ...(p.noCsa   || {}) },
+      claims:  { ...seed.pricing.claims,  ...(p.claims  || {}) } } };
+}
+
 function loadAll() {
-  /* A card saved by an earlier build will not have every key this one reads.
-     Fill the gaps from the seed rather than letting a missing key throw on boot. */
   const stored = store.read(LS.rateCard, null);
-  state.rateCard = stored
-    ? { ...JSON.parse(JSON.stringify(EMPTY_RATE_CARD)), ...stored,
-        aliases: stored.aliases || {},
-        legacyRates: stored.legacyRates || {} }
-    : JSON.parse(JSON.stringify(EMPTY_RATE_CARD));
+  state.rateCard = hydrateCard(stored);
   state.advisers = store.read(LS.advisers, null) || JSON.parse(JSON.stringify(EMPTY_ADVISERS));
   state.funds = (store.read(LS.funds, null) || JSON.parse(JSON.stringify(EMPTY_FUNDS))).map(normaliseFund);
 
@@ -1527,8 +1587,7 @@ async function loadReference() {
     let card;
     try { card = JSON.parse(f.CardJson || "{}"); }
     catch (e) { throw new Error("The rate card row's CardJson is not valid JSON. Fix it in SharePoint, or clear it and set the pricing again here."); }
-    state.rateCard = { ...JSON.parse(JSON.stringify(EMPTY_RATE_CARD)), ...card,
-      aliases: card.aliases || {}, legacyRates: card.legacyRates || {} };
+    state.rateCard = hydrateCard(card);
     if (!state.rateCard.version) state.rateCard.version = String(f.Title || "");
   }
 
@@ -3085,6 +3144,7 @@ const ICONS = {
   exceptions: '<path d="M12 4 3 19h18Z"/><path d="M12 10v4"/><circle cx="12" cy="17" r=".6" fill="currentColor"/>',
   approvals:  '<path d="M5 12.5 9.5 17 19 7"/>',
   ratecard:   '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18M7 14h4"/>',
+  pricing:    '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 11h2m3 0h3M8 15h2m3 0h3"/>',
   /* Keyed by view id — this was still "advisers" after the screen became
      "people", so the rail was drawing an empty svg. */
   people:     '<circle cx="9.5" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.9-5.5 6.5-5.5S16 15.7 16 19"/>' +
@@ -3101,6 +3161,10 @@ const VIEWS = [
     adviserLabel: "My Clients", adviserSection: "Fee Review", alsoAdviser: true },
   { id: "exceptions",label: "Exceptions", section: "Run",    needs: "run" },
   { id: "approvals", label: "Approvals",  section: "Run",    needs: "approve" },
+  /* Everyone gets this one, advisers included — it prices a new or existing
+     client and has nothing to do with whose book a run belongs to. */
+  { id: "pricing",   label: "Pricing Calculator", section: "Tools", needs: "pricing",
+    adviserSection: "Tools" },
   { id: "ratecard",  label: "Rate/Fee Settings", section: "Admin", needs: "rateCard" },
   { id: "people",    label: "People",     section: "Admin",  needs: "people" },
   { id: "settings",  label: "Settings",   section: "Admin",  needs: "settings" }
@@ -3304,10 +3368,16 @@ function render() {
   const run = currentRun();
   const titles = {
     run: "Run/Dashboard", review: "Review", exceptions: "Exceptions",
-    approvals: "Approvals", ratecard: "Rate/Fee Settings", people: "People", settings: "Settings"
+    approvals: "Approvals", pricing: "Pricing Calculator",
+    ratecard: "Rate/Fee Settings", people: "People", settings: "Settings"
   };
   $("#pgTitle").textContent = (adviserMode && state.view === "review") ? "My Clients" : (titles[state.view] || "Run/Dashboard");
-  $("#pgSub").innerHTML = run
+  /* The pricing calculator stands apart from the monthly run, so the subtitle
+     says what the prices are rather than which month is loaded. */
+  $("#pgSub").innerHTML = state.view === "pricing"
+    ? (pricing().reviewed ? "Pricing last reviewed " + esc(pricing().reviewed) : "Internal pricing") +
+      " &middot; all fees include GST"
+    : run
     ? monthLabel(run.key) + ' &middot; <span class="pill ' + statusPill(run.status) + '">' +
       esc(adviserMode ? adviserState(state.asAdviser).status : run.status) + "</span>" +
       (can("run") ? " &middot; " + run.rows.length.toLocaleString("en-AU") + " rows" : "")
@@ -3327,7 +3397,8 @@ function render() {
   paintSaveState();
 
   const fn = { run: viewRun, review: viewReview, exceptions: viewExceptions,
-               approvals: viewApprovals, ratecard: viewRateCard, people: viewPeople, settings: viewSettings }[state.view];
+               approvals: viewApprovals, pricing: viewPricing, ratecard: viewRateCard,
+               people: viewPeople, settings: viewSettings }[state.view];
   /* Says out loud, on every screen, that anybody can be anybody. Better a
      banner nobody can miss than a constant nobody remembers. */
   const bootstrapping = state.identity && state.identity.bootstrap;
@@ -4287,6 +4358,416 @@ function approvalDetail(adviser, ms) {
 }
 
 /* ---------------- Rate Card ---------------- */
+/* =========================================================================
+   Pricing calculator
+   Quotes a new or existing client off the internal pricing sheet, and prices an
+   insurance claim. It reads pricing and writes nothing: no client is named, no
+   quote is saved, and every figure is gone when the tab closes.
+   ========================================================================= */
+
+const pricing = () => (state.rateCard && state.rateCard.pricing) || EMPTY_PRICING;
+
+/* Held in memory on purpose. A FUM figure typed in here is client information
+   and has no business in localStorage. */
+const pricingInputs = {
+  tab: "advice",              // "advice" | "claims"
+  clientType: "EXISTING",
+  qty: {},                    // item id -> count, or hours for an hourly line
+  fum: 0,
+  onAgreement: true,
+  meansTested: false,
+  /* claims */
+  benefit: 0,
+  commissions: 0,
+  rateIdx: 0,
+  compHours: 0,
+  totalHours: 0,
+  multiClaim: false
+};
+
+const PRICE_SECTIONS = [
+  { id: "soa",    label: "SOA fees",        group: "Upfront" },
+  { id: "impl",   label: "Implementation",  group: "Upfront" },
+  { id: "csa",    label: "Ongoing (CSA)",   group: "Ongoing" },
+  { id: "hourly", label: "Fee for service", group: "Hourly"  }
+];
+
+function priceAdvice() {
+  const p = pricing();
+  const ct = pricingInputs.clientType;
+  const items = (p.items || []).map((it, i) => {
+    const raw = ct === "NEW" ? it.newPrice : it.existingPrice;
+    const price = (raw === null || raw === undefined || raw === "") ? null : num(raw);
+    return { ...it, i, price, na: price === null,
+             qty: it.kind === "min" ? 1 : num(pricingInputs.qty[it.id] || 0) };
+  });
+
+  /* An insurance-only engagement carries no base SOA fee. One line cancelling
+     another is the sheet's rule, kept as a flag on the line that does it. */
+  const suppressed = {};
+  for (const i of items) if (i.suppressesMin && !i.na && i.qty > 0) suppressed[i.section] = true;
+
+  for (const i of items) {
+    i.suppressed = i.kind === "min" && !!suppressed[i.section];
+    i.amount = i.na || i.suppressed ? 0 : (i.kind === "min" ? i.price : i.qty * i.price);
+  }
+
+  const sum = s => items.filter(i => i.section === s).reduce((a, i) => a + i.amount, 0);
+  const soa = sum("soa"), impl = sum("impl"), csa = sum("csa"), hourly = sum("hourly");
+
+  const ladder = ((p.ladders || {})[ct] || []).map(b => ({ from: num(b.from), rate: num(b.rate) }));
+  const fum = num(pricingInputs.fum);
+  const fumFee = ladder.length ? surchargeFor(fum, ladder) : 0;
+
+  const ongoing = csa + fumFee;
+  const upfront = soa + impl;
+
+  /* The service tier a client lands in is decided by the ongoing fee, not by
+     what they hold — a small balance on a lot of entities still climbs. */
+  const packs = [...(p.packages || [])].sort((a, b) => num(a.from) - num(b.from));
+  let pack = null;
+  for (const k of packs) if (ongoing >= num(k.from)) pack = k;
+
+  /* Centrelink admin sits outside the agreement and is invoiced or direct
+     debited, so it is never rolled into either total. */
+  const src = pricingInputs.onAgreement ? pack : p.noCsa;
+  const centrelink = src ? num(pricingInputs.meansTested ? src.mtf : src.cas) : null;
+
+  return { items, soa, impl, csa, hourly, ladder, fum, fumFee, ongoing, upfront,
+           pack, centrelink, packs,
+           pctOfFum: fum > 0 ? ongoing / fum : null };
+}
+
+function priceClaim() {
+  const c = pricing().claims || {};
+  const tiers = (c.tiers || []).map(t => ({ from: num(t.from), rate: num(t.rate) }));
+  const benefit = num(pricingInputs.benefit);
+  const tierFee = tiers.length ? surchargeFor(benefit, tiers) : 0;
+  const comms = num(pricingInputs.commissions);
+  /* Commissions already earned offset this claim's fee but cannot push it below
+     zero — a long commission history reduces the fee to nil, it does not create
+     a credit that eats into the hourly charge. */
+  const commsApplied = Math.min(comms, tierFee);
+  const lump = Math.max(0, tierFee - comms);
+
+  const rateRow = (c.rates || [])[pricingInputs.rateIdx] || null;
+  const rate = rateRow ? num(rateRow.hourly) : 0;
+  const billable = Math.max(0, num(pricingInputs.totalHours) - num(pricingInputs.compHours));
+  const hoursFee = billable * rate;
+
+  const disc = pricingInputs.multiClaim ? num(c.multiDiscount) : 0;
+  return { tiers, benefit, tierFee, comms, commsApplied, capped: comms > tierFee,
+           lump, lumpNet: lump * (1 - disc), rateRow, rate, billable, hoursFee,
+           hoursNet: hoursFee * (1 - disc), disc,
+           ipMonthly: rateRow ? num(rateRow.ipMonthly) : 0 };
+}
+
+const pricingTabBtn = (id, label) =>
+  '<button class="btn' + (pricingInputs.tab === id ? "" : " ghost") + '" data-ptab="' + id + '">' + esc(label) + "</button>";
+
+function viewPricing() {
+  const p = pricing();
+  let html = "";
+  if (!(p.items || []).length) {
+    html += '<div class="banner warn">' + (can("rateCardEdit")
+      ? "<strong>No pricing loaded yet.</strong> Rate/Fee Settings &rarr; <strong>Pricing calculator</strong> &rarr; " +
+        "<strong>Load pricing</strong> takes the pricing sheet as JSON and fills this screen in."
+      : "<strong>No pricing loaded yet.</strong> A Manager or Admin sets this up on the Rate/Fee Settings screen.") +
+      "</div>";
+  }
+  html += '<div class="toggle-row no-print" style="margin-bottom:16px">' +
+    pricingTabBtn("advice", "Advice fees") + pricingTabBtn("claims", "Insurance claims") + "</div>";
+  return html + (pricingInputs.tab === "claims" ? pricingClaimsView(p) : pricingAdviceView(p));
+}
+
+/* One row per priced line. `min` lines show no quantity box because they apply
+   once or not at all, and a line that does not exist for this client type is
+   struck out rather than silently priced at zero. */
+function priceRow(it, unit) {
+  if (it.na) {
+    return '<tr class="muted"><td>' + esc(it.label) + "</td>" +
+      '<td class="num">n/a</td><td class="num">&mdash;</td><td class="num">&mdash;</td></tr>';
+  }
+  const qtyCell = it.kind === "min"
+    ? '<td class="num small muted">' + (it.suppressed ? "waived" : "applies once") + "</td>"
+    : '<td class="num"><input type="number" min="0" step="' + (it.kind === "hour" ? "0.25" : "1") +
+      '" class="w80 num" data-pq="' + esc(it.id) + '" value="' + (pricingInputs.qty[it.id] || "") +
+      '" placeholder="0"></td>';
+  return "<tr" + (it.suppressed ? ' class="muted"' : "") + "><td>" + esc(it.label) +
+    (it.note ? '<div class="small muted">' + esc(it.note) + "</div>" : "") + "</td>" +
+    qtyCell +
+    '<td class="num mono">' + money(it.price) + (unit ? '<span class="small muted">' + unit + "</span>" : "") + "</td>" +
+    '<td class="num mono" data-pamt="' + it.i + '">' + money(it.amount) + "</td></tr>";
+}
+
+function priceSectionCard(a, section, title, sub, unit, totalId) {
+  const rows = a.items.filter(i => i.section === section);
+  if (!rows.length) return "";
+  return '<div class="card"><div class="card-h"><h2>' + esc(title) + "</h2>" +
+    (sub ? '<div class="sub">' + esc(sub) + "</div>" : "") + '</div><div class="card-b">' +
+    '<div class="tbl-scroll"><table><thead><tr><th>Item</th>' +
+    '<th class="num">' + (section === "hourly" ? "Hours" : "#") + "</th>" +
+    '<th class="num">' + (section === "hourly" ? "Rate" : "Price") + "</th>" +
+    '<th class="num">Amount</th></tr></thead><tbody>' +
+    rows.map(r => priceRow(r, unit)).join("") +
+    '</tbody><tfoot><tr><th colspan="3">Total</th>' +
+    '<th class="num mono" id="' + totalId + '">' + money(rows.reduce((x, r) => x + r.amount, 0)) +
+    "</th></tr></tfoot></table></div></div></div>";
+}
+
+function pricingAdviceView(p) {
+  const a = priceAdvice();
+  const ct = pricingInputs.clientType;
+  const typeBtn = t => '<button class="btn' + (ct === t ? "" : " ghost") + '" data-ptype="' + t + '">' + t + "</button>";
+
+  let html = '<div class="card no-print" style="margin-bottom:16px"><div class="card-b">' +
+    '<div class="toggle-row"><div><label style="display:block;font-size:.68rem;letter-spacing:.08em;' +
+    'text-transform:uppercase;color:var(--ink-muted);margin-bottom:4px">Client type</label>' +
+    typeBtn("NEW") + " " + typeBtn("EXISTING") + "</div>" +
+    '<div class="small muted" style="max-width:46ch">Nearly every price on this screen changes with it. ' +
+    "Existing clients include those who came across through a merger or acquisition.</div></div>" +
+    "</div></div>";
+
+  /* stat() escapes what it is given, so these carry real characters rather than
+     entities — "&mdash;" would print as those seven letters. */
+  html += '<div class="stats">' +
+    stat("Total upfront", money(a.upfront), "SOA and implementation", "") +
+    stat("Total ongoing", money(a.ongoing), "per year, including FUM", "") +
+    stat("Fee as % of FUM", a.pctOfFum === null ? "—" : (a.pctOfFum * 100).toFixed(2) + "%",
+         a.fum > 0 ? "on " + money(a.fum) : "enter FUM below", "") +
+    stat("Service package", a.pack ? a.pack.name : "—",
+         a.pack ? "from " + money(num(a.pack.from)) + " ongoing" : "set by the ongoing fee", "") +
+    "</div>";
+
+  html += '<div class="grid2 wide">';
+  html += priceSectionCard(a, "soa",  "Upfront — SOA fees", "Statement of Advice, charged once", "", "ptSoa");
+  html += priceSectionCard(a, "impl", "Upfront — Implementation", "Charged per instance", "", "ptImpl");
+
+  /* Ongoing needs the FUM ladder alongside it, so it is built here rather than
+     through priceSectionCard(). */
+  const csaRows = a.items.filter(i => i.section === "csa");
+  html += '<div class="card"><div class="card-h"><h2>Ongoing — CSA fee</h2>' +
+    '<div class="sub">Charged every year under the Client Service Agreement</div></div><div class="card-b">' +
+    (csaRows.length
+      ? '<div class="tbl-scroll"><table><thead><tr><th>Item</th><th class="num">#</th><th class="num">Price</th>' +
+        '<th class="num">Amount</th></tr></thead><tbody>' + csaRows.map(r => priceRow(r, "")).join("") +
+        "</tbody></table></div>"
+      : '<div class="muted">No ongoing lines set.</div>') +
+    '<div class="spacer"></div>' +
+    '<div class="field"><label>Total FUM</label>' +
+    '<input type="number" min="0" step="1000" data-pf="fum" value="' + (pricingInputs.fum || "") + '" placeholder="0"></div>' +
+    '<div class="spacer"></div>' +
+    (a.ladder.length
+      ? '<div class="tbl-scroll"><table><thead><tr><th>FUM band</th><th class="num">Rate</th>' +
+        '<th class="num">Charged</th></tr></thead><tbody>' +
+        a.ladder.map((b, i) => {
+          const to = i + 1 < a.ladder.length ? a.ladder[i + 1].from : null;
+          const slice = Math.min(Math.max(a.fum - b.from, 0), (to === null ? Infinity : to - b.from));
+          return "<tr" + (slice > 0 ? "" : ' class="muted"') + "><td>" + money(b.from) +
+            (to === null ? "+" : " &ndash; " + money(to)) + "</td>" +
+            '<td class="num">' + (b.rate * 100).toFixed(2) + "%</td>" +
+            '<td class="num mono" data-pband="' + i + '">' + money(slice * b.rate) + "</td></tr>";
+        }).join("") +
+        '</tbody><tfoot><tr><th colspan="2">FUM fee</th><th class="num mono" id="ptFum">' + money(a.fumFee) +
+        "</th></tr></tfoot></table></div>"
+      : '<div class="muted">No FUM bands set for ' + esc(ct) + " clients, so FUM adds nothing.</div>") +
+    '<div class="spacer"></div>' +
+    '<div class="result-line"><strong>Total ongoing fee</strong><span class="mono" id="ptOngoing">' +
+      money(a.ongoing) + "</span></div>" +
+    '<div class="spacer"></div><div class="small muted"><strong>Marginal, like tax brackets.</strong> The first band is ' +
+    "inclusive of the minimum &mdash; it charges nothing, because the minimum above already covers it. Each band after that " +
+    "charges its rate only on the part of the balance inside it, so the minimum and the FUM fee add together rather than " +
+    "one replacing the other.</div>" +
+    "</div></div>";
+
+  html += priceSectionCard(a, "hourly", "Fee for service", "Charged by the hour, outside any agreement", "/hr", "ptHourly");
+
+  /* Centrelink admin: two questions and a lookup, exactly as the sheet does it. */
+  html += '<div class="card"><div class="card-h"><h2>Centrelink administration</h2>' +
+    '<div class="sub">Not part of the Client Service Agreement</div></div><div class="card-b">' +
+    '<label class="toggle-row" style="cursor:pointer"><input type="checkbox" data-pb="onAgreement"' +
+      (pricingInputs.onAgreement ? " checked" : "") + "> Client is on a Service Agreement</label>" +
+    '<div class="spacer"></div>' +
+    '<label class="toggle-row" style="cursor:pointer"><input type="checkbox" data-pb="meansTested"' +
+      (pricingInputs.meansTested ? " checked" : "") + "> Means tested fee (quarterly updates)</label>" +
+    '<div class="spacer"></div>' +
+    '<div class="result-line"><strong>Centrelink service fee</strong><span class="mono" id="ptCentrelink">' +
+      money(a.centrelink) + "</span></div>" +
+    '<div class="spacer"></div><div class="small muted">Priced off the service package above &mdash; currently <strong>' +
+    (pricingInputs.onAgreement ? (a.pack ? esc(a.pack.name) : "no package") : "no agreement") +
+    "</strong>. Payable personally by direct debit or invoice, and never included in the Client Service Agreement.</div>" +
+    "</div></div>";
+
+  html += "</div>";
+  html += pricingReference(p);
+  return html;
+}
+
+function pricingClaimsView(p) {
+  const c = priceClaim();
+  const rates = (p.claims && p.claims.rates) || [];
+
+  let html = '<div class="stats">' +
+    stat("Lump sum fee", money(c.lumpNet), c.capped ? "commissions cover the tier fee" : "TPD, after commissions", "") +
+    stat("Hourly fee", money(c.hoursNet), c.billable ? c.billable + " billable hrs" : "Life, Trauma, Income Protection", "") +
+    (c.ipMonthly ? stat("IP monthly management", money(c.ipMonthly), "per month, once a claim is paid", "") : "") +
+    "</div>";
+
+  html += '<div class="grid2 wide">';
+
+  html += '<div class="card"><div class="card-h"><h2>TPD &mdash; lump sum</h2>' +
+    '<div class="sub">A one-off fee on the insured benefit</div></div><div class="card-b">' +
+    (c.tiers.length
+      ? '<div class="tbl-scroll"><table><thead><tr><th>Benefit band</th><th class="num">Rate</th>' +
+        '<th class="num">Charged</th></tr></thead><tbody>' +
+        c.tiers.map((t, i) => {
+          const to = i + 1 < c.tiers.length ? c.tiers[i + 1].from : null;
+          const slice = Math.min(Math.max(c.benefit - t.from, 0), (to === null ? Infinity : to - t.from));
+          return "<tr" + (slice > 0 ? "" : ' class="muted"') + "><td>" + money(t.from) +
+            (to === null ? "+" : " &ndash; " + money(to)) + "</td>" +
+            '<td class="num">' + (t.rate * 100).toFixed(2) + "%</td>" +
+            '<td class="num mono" data-ptband="' + i + '">' + money(slice * t.rate) + "</td></tr>";
+        }).join("") + "</tbody></table></div>"
+      : '<div class="muted">No claim tiers set.</div>') +
+    '<div class="spacer"></div>' +
+    '<div class="field"><label>TPD benefit amount</label>' +
+    '<input type="number" min="0" step="1000" data-pf="benefit" value="' + (pricingInputs.benefit || "") + '" placeholder="0"></div>' +
+    '<div class="spacer"></div>' +
+    '<div class="field"><label>Commissions received (last 12 months)</label>' +
+    '<input type="number" min="0" step="100" data-pf="commissions" value="' + (pricingInputs.commissions || "") + '" placeholder="0"></div>' +
+    '<div class="spacer"></div>' +
+    '<div class="result-line"><span>Gross tier fee</span><span class="mono" id="pcGross">' + money(c.tierFee) + "</span></div>" +
+    '<div class="result-line"><span>Less commissions</span><span class="mono" id="pcComms">' +
+      (c.commsApplied ? "&minus;" : "") + money(c.commsApplied) + "</span></div>" +
+    '<div class="result-line"><strong>Lump sum fee</strong><span class="mono" id="pcLump">' + money(c.lumpNet) + "</span></div>" +
+    '<div class="spacer"></div><div class="small muted" id="pcNote">' + claimLumpNote(c) + "</div>" +
+    "</div></div>";
+
+  html += '<div class="card"><div class="card-h"><h2>Life, Trauma, Income Protection &mdash; hourly</h2>' +
+    '<div class="sub">Charged by the hour for every other claim type</div></div><div class="card-b">' +
+    (rates.length
+      ? '<div class="field"><label>Policy type</label><select data-pf="rateIdx">' +
+        rates.map((r, i) => '<option value="' + i + '"' + (pricingInputs.rateIdx === i ? " selected" : "") + ">" +
+          esc(r.label) + " &mdash; " + money(num(r.hourly)) + "/hr</option>").join("") + "</select></div>"
+      : '<div class="muted">No hourly rates set.</div>') +
+    '<div class="spacer"></div>' +
+    '<div class="field"><label>Complimentary hours</label>' +
+    '<input type="number" min="0" step="0.25" data-pf="compHours" value="' + (pricingInputs.compHours || "") + '" placeholder="0"></div>' +
+    '<div class="spacer"></div>' +
+    '<div class="field"><label>Approximate total hours</label>' +
+    '<input type="number" min="0" step="0.25" data-pf="totalHours" value="' + (pricingInputs.totalHours || "") + '" placeholder="0"></div>' +
+    '<div class="spacer"></div>' +
+    '<div class="result-line"><strong>Hourly fee</strong><span class="mono" id="pcHours">' + money(c.hoursNet) + "</span></div>" +
+    '<div class="spacer"></div><div class="small muted" id="pcHoursNote">' + claimHoursNote(c) + "</div>" +
+    "</div></div>";
+
+  html += "</div>";
+
+  if (p.claims && num(p.claims.multiDiscount) > 0) {
+    html += '<div class="card" style="margin-top:16px"><div class="card-b">' +
+      '<label class="toggle-row" style="cursor:pointer"><input type="checkbox" data-pb="multiClaim"' +
+        (pricingInputs.multiClaim ? " checked" : "") + "> Multiple claims lodged with the same insurer</label>" +
+      '<div class="spacer"></div><div class="small muted">Two claims with one insurer &mdash; income protection and trauma, ' +
+      "say &mdash; discount <strong>both</strong> claim fees by " + (num(p.claims.multiDiscount) * 100).toFixed(0) +
+      "%. Ticking this applies the discount to the lump sum and the hourly fee above.</div></div></div>";
+  }
+
+  html += pricingReference(p, "claims");
+  return html;
+}
+
+function claimLumpNote(c) {
+  if (!c.benefit) return "Enter a benefit amount to price the lump sum.";
+  let s = "Marginal, like tax brackets &mdash; each band charges only on the part of the benefit inside it.";
+  if (c.capped) s += " Commissions of " + money(c.comms) + " exceed the tier fee, so the deduction is capped at " +
+    money(c.tierFee) + " and the lump sum is nil rather than a credit.";
+  if (c.disc) s += " A " + (c.disc * 100).toFixed(0) + "% multi-claim discount is applied.";
+  return s;
+}
+
+function claimHoursNote(c) {
+  if (!num(pricingInputs.totalHours)) return "Enter hours to price the claim.";
+  let s = c.billable + " billable hr" + (c.billable === 1 ? "" : "s") + " (" + num(pricingInputs.totalHours) +
+    " total &minus; " + num(pricingInputs.compHours) + " complimentary) &times; " + money(c.rate) + "/hr.";
+  if (c.ipMonthly) s += " Income protection claims then carry " + money(c.ipMonthly) +
+    " a month, starting only once the first claim payment reaches the client.";
+  if (c.disc) s += " A " + (c.disc * 100).toFixed(0) + "% multi-claim discount is applied.";
+  return s;
+}
+
+/* Preferred insurers, preferred platforms, Centrelink criteria — reference text
+   that decides which price applies, so it belongs beside the calculator. */
+function pricingReference(p, only) {
+  const list = (p.reference || []).filter(r => !only || (r.tags || "").includes(only) || !r.tags);
+  if (!list.length) return "";
+  return '<div class="card" style="margin-top:16px"><div class="card-h"><h2>Reference</h2>' +
+    '<div class="sub">Which list a fund or insurer falls on decides which price applies</div></div>' +
+    '<div class="card-b"><div class="grid2 wide">' +
+    list.map(r => '<div><div style="font-weight:600;margin-bottom:6px">' + esc(r.title) + "</div>" +
+      '<div class="small muted" style="white-space:pre-line">' + esc(r.body) + "</div></div>").join("") +
+    "</div></div></div>";
+}
+
+/* Repaints every computed figure without rebuilding the screen, so typing in a
+   box does not take the focus out of it. */
+function paintPricing() {
+  const set = (sel, v) => { const el = document.querySelector(sel); if (el) el.innerHTML = v; };
+  if (pricingInputs.tab === "claims") {
+    const c = priceClaim();
+    c.tiers.forEach((t, i) => {
+      const to = i + 1 < c.tiers.length ? c.tiers[i + 1].from : null;
+      const slice = Math.min(Math.max(c.benefit - t.from, 0), (to === null ? Infinity : to - t.from));
+      const cell = document.querySelector('[data-ptband="' + i + '"]');
+      if (cell) { cell.textContent = money(slice * t.rate); cell.closest("tr").classList.toggle("muted", !(slice > 0)); }
+    });
+    set("#pcGross", money(c.tierFee));
+    set("#pcComms", (c.commsApplied ? "&minus;" : "") + money(c.commsApplied));
+    set("#pcLump", money(c.lumpNet));
+    set("#pcHours", money(c.hoursNet));
+    set("#pcNote", claimLumpNote(c));
+    set("#pcHoursNote", claimHoursNote(c));
+    return;
+  }
+
+  const a = priceAdvice();
+  a.items.forEach(it => {
+    const cell = document.querySelector('[data-pamt="' + it.i + '"]');
+    if (cell) cell.textContent = money(it.amount);
+    if (it.kind === "min" && cell) {
+      const q = cell.closest("tr").querySelector("td.num.small");
+      if (q) q.textContent = it.suppressed ? "waived" : "applies once";
+      cell.closest("tr").classList.toggle("muted", !!it.suppressed);
+    }
+  });
+  const sum = s => a.items.filter(i => i.section === s).reduce((x, i) => x + i.amount, 0);
+  set("#ptSoa", money(sum("soa")));
+  set("#ptImpl", money(sum("impl")));
+  set("#ptHourly", money(sum("hourly")));
+  a.ladder.forEach((b, i) => {
+    const to = i + 1 < a.ladder.length ? a.ladder[i + 1].from : null;
+    const slice = Math.min(Math.max(a.fum - b.from, 0), (to === null ? Infinity : to - b.from));
+    const cell = document.querySelector('[data-pband="' + i + '"]');
+    if (cell) { cell.textContent = money(slice * b.rate); cell.closest("tr").classList.toggle("muted", !(slice > 0)); }
+  });
+  set("#ptFum", money(a.fumFee));
+  set("#ptOngoing", money(a.ongoing));
+  set("#ptCentrelink", money(a.centrelink));
+
+  /* The four headline figures at the top move with every keystroke too. */
+  const vals = document.querySelectorAll(".stats .stat .v");
+  const notes = document.querySelectorAll(".stats .stat .n");
+  if (vals.length >= 4) {
+    vals[0].textContent = money(a.upfront);
+    vals[1].textContent = money(a.ongoing);
+    vals[2].textContent = a.pctOfFum === null ? "—" : (a.pctOfFum * 100).toFixed(2) + "%";
+    vals[3].textContent = a.pack ? a.pack.name : "—";
+    if (notes.length >= 4) {
+      notes[2].textContent = a.fum > 0 ? "on " + money(a.fum) : "enter FUM below";
+      notes[3].textContent = a.pack ? "from " + money(num(a.pack.from)) + " ongoing" : "set by the ongoing fee";
+    }
+  }
+}
+
 function viewRateCard() {
   const rc = state.rateCard;
   const ro = !can("rateCardEdit") ? " disabled" : "";
@@ -4402,7 +4883,184 @@ function viewRateCard() {
   html += "</div>";
   html += fundCapCard();
   html += categoryMappingCard();
+  html += pricingSettingsCard();
   return html;
+}
+
+/* An empty box means "this line does not exist for that client type", which is
+   not the same as a price of nothing — so it stays null rather than becoming 0. */
+const priceVal = v => (v === "" || v === null || v === undefined) ? null : num(v);
+const priceBox = v => (v === null || v === undefined) ? "" : v;
+
+function newItemId(items) {
+  let n = 1;
+  const taken = new Set(items.map(i => i.id));
+  while (taken.has("i" + n)) n++;
+  return "i" + n;
+}
+
+/* Editing for everything the Pricing Calculator reads. It lives here rather
+   than on the calculator itself so advisers get a calculator, not a price list
+   they can retype. */
+function pricingSettingsCard() {
+  const p = pricing();
+  const ro = !can("rateCardEdit") ? " disabled" : "";
+  const del = (what, i, extra) => ro ? "" :
+    '<td class="no-print"><button class="btn ghost icon-x" data-pedel="' + what + '" data-i="' + i + '"' +
+    (extra || "") + ' title="Remove" aria-label="Remove">&times;</button></td>';
+
+  let html = '<div class="card" style="margin-top:16px"><div class="card-h"><h2>Pricing calculator</h2>' +
+    '<div class="sub">What the Pricing Calculator screen quotes from</div>' +
+    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" id="btnPriceLoad">Load pricing</button>' +
+      '<button class="btn ghost btn-sm" id="btnPriceCopy">Copy pricing</button></div>') +
+    '</div><div class="card-b">';
+
+  html += '<div class="banner info no-print">These are Coastal\'s own prices, not a platform\'s. They travel with the ' +
+    'rate card, so there is one place pricing lives and one thing to keep current. Advisers see the calculator, ' +
+    'never this screen.</div>';
+
+  html += '<div class="field"><label>Pricing last reviewed</label>' +
+    '<input type="text" data-pe="scalar" data-f="reviewed" value="' + esc(p.reviewed || "") +
+    '" placeholder="30 June 2026"' + ro + "></div>";
+
+  /* ---- line items, grouped by what they are ---- */
+  for (const sec of PRICE_SECTIONS) {
+    const rows = (p.items || []).map((it, i) => ({ it, i })).filter(x => x.it.section === sec.id);
+    html += '<div class="spacer"></div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">' +
+      esc(sec.group) + " &mdash; " + esc(sec.label) + "</h2>" +
+      (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="item" data-sec="' +
+        sec.id + '">Add line</button></div>') + "</div>";
+    html += rows.length
+      ? '<div class="tbl-scroll"><table><thead><tr><th>Line</th><th>Applies</th>' +
+        '<th class="num">NEW</th><th class="num">EXISTING</th><th>Cancels minimum</th>' +
+        (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+        rows.map(({ it, i }) =>
+          '<tr><td><input type="text" class="grow-x" data-pe="item" data-i="' + i + '" data-f="label" value="' +
+            esc(it.label || "") + '"' + ro + "></td>" +
+          '<td><select class="w110" data-pe="item" data-i="' + i + '" data-f="kind"' + ro + ">" +
+            PRICE_KINDS.map(k => '<option value="' + k + '"' + (it.kind === k ? " selected" : "") + ">" +
+              { min: "once", each: "per item", hour: "per hour" }[k] + "</option>").join("") + "</select></td>" +
+          '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
+            '" data-f="newPrice" value="' + priceBox(it.newPrice) + '" placeholder="n/a"' + ro + "></td>" +
+          '<td class="num"><input type="number" class="w110 num" data-pe="item" data-i="' + i +
+            '" data-f="existingPrice" value="' + priceBox(it.existingPrice) + '" placeholder="n/a"' + ro + "></td>" +
+          '<td><input type="checkbox" data-pe="itemBool" data-i="' + i + '" data-f="suppressesMin"' +
+            (it.suppressesMin ? " checked" : "") + ro + "></td>" +
+          del("item", i) + "</tr>").join("") + "</tbody></table></div>"
+      : '<div class="muted">No lines in this section.</div>';
+  }
+
+  html += '<div class="spacer"></div><div class="small muted">An empty price box means the line <strong>does not exist</strong> ' +
+    'for that client type &mdash; different from a price of zero, which is a real price of nothing. ' +
+    '<strong>Once</strong> lines apply on their own with no quantity; <strong>cancels minimum</strong> marks a line that waives ' +
+    "its section's once-line when it is used, which is how an insurance-only engagement escapes the base SOA fee.</div>";
+
+  /* ---- FUM ladders ---- */
+  html += '<div class="spacer"></div><div class="grid2 wide">';
+  for (const ct of ["NEW", "EXISTING"]) {
+    const bands = ((p.ladders || {})[ct] || []);
+    html += '<div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">FUM ladder &mdash; ' +
+      ct + "</h2>" + (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="ladder" data-ct="' +
+        ct + '">Add band</button></div>') + "</div>" +
+      (bands.length
+        ? '<div class="tbl-scroll"><table><thead><tr><th class="num">FUM above</th><th class="num">Rate</th>' +
+          (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+          bands.map((b, i) =>
+            '<tr><td class="num"><input type="number" class="w110 num" data-pe="ladder" data-ct="' + ct +
+              '" data-i="' + i + '" data-f="from" value="' + num(b.from) + '"' + ro + "></td>" +
+            '<td class="num"><input type="number" step="0.0001" class="w80 num" data-pe="ladder" data-ct="' + ct +
+              '" data-i="' + i + '" data-f="rate" value="' + num(b.rate) + '"' + ro + ">" +
+              '<div class="small muted">' + (num(b.rate) * 100).toFixed(2) + "%</div></td>" +
+            del("ladder", i, ' data-ct="' + ct + '"') + "</tr>").join("") + "</tbody></table></div>"
+        : '<div class="muted">No bands, so FUM adds nothing for ' + ct + " clients.</div>") + "</div>";
+  }
+  html += "</div>";
+  html += '<div class="spacer"></div><div class="small muted">Marginal bands, the same shape as the FUM surcharge above. ' +
+    "The first band is normally a rate of zero: it is the stretch of FUM the minimum fee already covers. " +
+    "Rates are decimals &mdash; <code>0.0088</code> is 0.88%.</div>";
+
+  /* ---- packages and Centrelink ---- */
+  const packs = p.packages || [];
+  html += '<div class="spacer"></div><div class="card-h" style="padding-left:0;padding-right:0">' +
+    '<h2 style="font-size:.9rem">Service packages and Centrelink administration</h2>' +
+    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="pack">Add package</button></div>') + "</div>" +
+    '<div class="tbl-scroll"><table><thead><tr><th>Package</th><th class="num">Ongoing fee from</th>' +
+    '<th class="num">Centrelink admin</th><th class="num">Means tested</th>' + (ro ? "" : '<th class="no-print"></th>') +
+    "</tr></thead><tbody>" +
+    packs.map((k, i) =>
+      '<tr><td><input type="text" class="grow-x" data-pe="pack" data-i="' + i + '" data-f="name" value="' +
+        esc(k.name || "") + '"' + ro + "></td>" +
+      '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="from" value="' +
+        num(k.from) + '"' + ro + "></td>" +
+      '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="cas" value="' +
+        num(k.cas) + '"' + ro + "></td>" +
+      '<td class="num"><input type="number" class="w110 num" data-pe="pack" data-i="' + i + '" data-f="mtf" value="' +
+        num(k.mtf) + '"' + ro + "></td>" + del("pack", i) + "</tr>").join("") +
+    '<tr><td class="muted">No agreement</td><td class="num muted">&mdash;</td>' +
+    '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="cas" value="' +
+      num((p.noCsa || {}).cas) + '"' + ro + "></td>" +
+    '<td class="num"><input type="number" class="w110 num" data-pe="noCsa" data-f="mtf" value="' +
+      num((p.noCsa || {}).mtf) + '"' + ro + "></td>" + (ro ? "" : "<td></td>") + "</tr>" +
+    "</tbody></table></div>" +
+    '<div class="spacer"></div><div class="small muted">A client falls into the highest package their <strong>total ongoing ' +
+    "fee</strong> reaches. The two Centrelink columns are that package's administration fee &mdash; the second applies when " +
+    "the client needs quarterly means-tested updates. Neither is part of the Client Service Agreement.</div>";
+
+  /* ---- insurance claims ---- */
+  const cl = p.claims || {};
+  html += '<div class="spacer"></div><div class="grid2 wide">';
+  html += '<div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">Claim fee tiers (TPD)</h2>' +
+    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="tier">Add tier</button></div>') + "</div>" +
+    ((cl.tiers || []).length
+      ? '<div class="tbl-scroll"><table><thead><tr><th class="num">Benefit above</th><th class="num">Rate</th>' +
+        (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+        cl.tiers.map((t, i) =>
+          '<tr><td class="num"><input type="number" class="w110 num" data-pe="tier" data-i="' + i +
+            '" data-f="from" value="' + num(t.from) + '"' + ro + "></td>" +
+          '<td class="num"><input type="number" step="0.0001" class="w80 num" data-pe="tier" data-i="' + i +
+            '" data-f="rate" value="' + num(t.rate) + '"' + ro + ">" +
+            '<div class="small muted">' + (num(t.rate) * 100).toFixed(2) + "%</div></td>" +
+          del("tier", i) + "</tr>").join("") + "</tbody></table></div>"
+      : '<div class="muted">No claim tiers set.</div>') + "</div>";
+
+  html += '<div><div class="card-h" style="padding-left:0;padding-right:0"><h2 style="font-size:.9rem">Claim hourly rates</h2>' +
+    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="crate">Add rate</button></div>') + "</div>" +
+    ((cl.rates || []).length
+      ? '<div class="tbl-scroll"><table><thead><tr><th>Policy type</th><th class="num">Per hour</th>' +
+        '<th class="num">IP per month</th>' + (ro ? "" : '<th class="no-print"></th>') + "</tr></thead><tbody>" +
+        cl.rates.map((r, i) =>
+          '<tr><td><input type="text" class="grow-x" data-pe="crate" data-i="' + i + '" data-f="label" value="' +
+            esc(r.label || "") + '"' + ro + "></td>" +
+          '<td class="num"><input type="number" class="w80 num" data-pe="crate" data-i="' + i + '" data-f="hourly" value="' +
+            num(r.hourly) + '"' + ro + "></td>" +
+          '<td class="num"><input type="number" class="w80 num" data-pe="crate" data-i="' + i + '" data-f="ipMonthly" value="' +
+            num(r.ipMonthly) + '"' + ro + "></td>" + del("crate", i) + "</tr>").join("") + "</tbody></table></div>"
+      : '<div class="muted">No hourly rates set.</div>') +
+    '<div class="spacer"></div><div class="field"><label>Multi-claim discount (fraction, e.g. 0.15)</label>' +
+    '<input type="number" step="0.01" data-pe="claimScalar" data-f="multiDiscount" value="' +
+      num(cl.multiDiscount) + '"' + ro + "></div></div>";
+  html += "</div>";
+
+  /* ---- reference text ---- */
+  const refs = p.reference || [];
+  html += '<div class="spacer"></div><div class="card-h" style="padding-left:0;padding-right:0">' +
+    '<h2 style="font-size:.9rem">Reference panels</h2>' +
+    (ro ? "" : '<div class="right no-print"><button class="btn ghost btn-sm" data-peadd="ref">Add panel</button></div>') + "</div>" +
+    (refs.length
+      ? '<div class="grid2 wide">' + refs.map((r, i) =>
+          '<div><input type="text" class="grow-x" data-pe="ref" data-i="' + i + '" data-f="title" value="' +
+            esc(r.title || "") + '" placeholder="Preferred platforms"' + ro + ">" +
+          '<div class="spacer" style="height:6px"></div>' +
+          '<textarea rows="6" style="width:100%" data-pe="ref" data-i="' + i + '" data-f="body"' + ro + ">" +
+            esc(r.body || "") + "</textarea>" +
+          (ro ? "" : '<button class="btn ghost btn-sm" data-pedel="ref" data-i="' + i + '">Remove panel</button>') +
+          "</div>").join("") + "</div>"
+      : '<div class="muted">No reference panels.</div>') +
+    '<div class="spacer"></div><div class="small muted">Shown at the bottom of the Pricing Calculator. This is where the ' +
+    "preferred insurer and platform lists live, and the Centrelink simple/complex criteria &mdash; which list something " +
+    "falls on is what decides which price applies.</div>";
+
+  return html + "</div></div>";
 }
 
 /* "Marginal" is a word people nod at and then get wrong, so show it happening on
@@ -4967,6 +5625,129 @@ function wire() {
       () => toast(outstanding.length + " advisers copied to the clipboard."),
       () => toast("Could not copy — clipboard blocked.", "bad"));
   });
+
+  /* --- pricing calculator ---
+     Quantities and amounts repaint in place on every keystroke. Anything that
+     changes the shape of the screen — the tab, the client type, a checkbox that
+     rewrites the explanation under it — rebuilds, and those are all clicks, so
+     no one is typing when it happens. */
+  document.querySelectorAll("[data-ptab]").forEach(el =>
+    el.addEventListener("click", () => { pricingInputs.tab = el.dataset.ptab; render(); }));
+  document.querySelectorAll("[data-ptype]").forEach(el =>
+    el.addEventListener("click", () => { pricingInputs.clientType = el.dataset.ptype; render(); }));
+  document.querySelectorAll("[data-pq]").forEach(el =>
+    el.addEventListener("input", () => { pricingInputs.qty[el.dataset.pq] = num(el.value); paintPricing(); }));
+  document.querySelectorAll("[data-pf]").forEach(el =>
+    el.addEventListener(el.tagName === "SELECT" ? "change" : "input", () => {
+      pricingInputs[el.dataset.pf] = el.dataset.pf === "rateIdx" ? parseInt(el.value, 10) || 0 : num(el.value);
+      paintPricing();
+    }));
+  document.querySelectorAll("[data-pb]").forEach(el =>
+    el.addEventListener("change", () => { pricingInputs[el.dataset.pb] = el.checked; render(); }));
+
+  /* --- pricing editor, on Rate/Fee Settings --- */
+  const pr = () => state.rateCard.pricing || (state.rateCard.pricing = JSON.parse(JSON.stringify(EMPTY_PRICING)));
+  const PE_TEXT = ["label", "name", "title", "body", "kind", "reviewed"];
+
+  document.querySelectorAll("[data-pe]").forEach(el =>
+    el.addEventListener("change", () => {
+      const p = pr(), i = +el.dataset.i, f = el.dataset.f;
+      const v = PE_TEXT.includes(f) ? el.value
+        : (f === "newPrice" || f === "existingPrice") ? priceVal(el.value)
+        : num(el.value);
+      switch (el.dataset.pe) {
+        case "scalar":      p[f] = v; break;
+        case "item":        p.items[i][f] = v; break;
+        case "itemBool":    p.items[i][f] = el.checked; break;
+        case "ladder":      p.ladders[el.dataset.ct][i][f] = v; break;
+        case "pack":        p.packages[i][f] = v; break;
+        case "noCsa":       p.noCsa[f] = v; break;
+        case "tier":        p.claims.tiers[i][f] = v; break;
+        case "crate":       p.claims.rates[i][f] = v; break;
+        case "claimScalar": p.claims[f] = v; break;
+        case "ref":         p.reference[i][f] = v; break;
+      }
+      saveRateCard(); render();
+    }));
+
+  document.querySelectorAll("[data-peadd]").forEach(el =>
+    el.addEventListener("click", () => {
+      const p = pr();
+      /* A new band starts above the current top one, which is where it almost
+         always goes, rather than at zero where it collides with the first. */
+      const above = (list, step) => { const t = (list || []).map(x => num(x.from)); return t.length ? Math.max(...t) + step : 0; };
+      switch (el.dataset.peadd) {
+        case "item":
+          p.items.push({ id: newItemId(p.items), section: el.dataset.sec, label: "New line",
+                         kind: el.dataset.sec === "hourly" ? "hour" : "each",
+                         newPrice: 0, existingPrice: 0, suppressesMin: false, note: "" });
+          break;
+        case "ladder":
+          (p.ladders[el.dataset.ct] = p.ladders[el.dataset.ct] || [])
+            .push({ from: above(p.ladders[el.dataset.ct], 500000), rate: 0 });
+          break;
+        case "pack":
+          p.packages.push({ name: "New package", from: above(p.packages, 5000), cas: 0, mtf: 0 });
+          break;
+        case "tier":
+          (p.claims.tiers = p.claims.tiers || []).push({ from: above(p.claims.tiers, 250000), rate: 0 });
+          break;
+        case "crate":
+          (p.claims.rates = p.claims.rates || []).push({ label: "New policy type", hourly: 0, ipMonthly: 0 });
+          break;
+        case "ref":
+          (p.reference = p.reference || []).push({ title: "New panel", body: "" });
+          break;
+      }
+      saveRateCard(); render();
+    }));
+
+  document.querySelectorAll("[data-pedel]").forEach(el =>
+    el.addEventListener("click", () => {
+      const p = pr(), i = +el.dataset.i, what = el.dataset.pedel;
+      const list = { item: p.items, ladder: (p.ladders || {})[el.dataset.ct], pack: p.packages,
+                     tier: p.claims.tiers, crate: p.claims.rates, ref: p.reference }[what];
+      if (!list || !list[i]) return;
+      const named = list[i].label || list[i].name || list[i].title || "";
+      if (named && !confirm('Remove "' + named + '"?')) return;
+      list.splice(i, 1);
+      saveRateCard(); render();
+    }));
+
+  if ($("#btnPriceCopy")) $("#btnPriceCopy").addEventListener("click", () =>
+    navigator.clipboard.writeText(JSON.stringify(pricing(), null, 2)).then(
+      () => toast("Pricing copied as JSON."),
+      () => toast("Could not copy — the clipboard is blocked.", "bad")));
+
+  if ($("#btnPriceLoad")) $("#btnPriceLoad").addEventListener("click", () =>
+    showDialog("Load pricing",
+      '<p class="small muted">Paste the pricing sheet as JSON. Everything on this card is replaced, ' +
+      "and the change saves with the rate card like any other edit here.</p>" +
+      '<textarea id="priceJson" class="mono" rows="14" style="width:100%" placeholder="{ &quot;items&quot;: [ … ] }"></textarea>',
+      "Load", () => {
+        let parsed;
+        try { parsed = JSON.parse((($("#priceJson") || {}).value || "").trim()); }
+        catch (e) { toast("That is not valid JSON, so nothing was changed.", "bad"); return false; }
+        if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.items)) {
+          toast("That JSON has no items list, so it is not a pricing sheet.", "bad"); return false;
+        }
+        const seed = JSON.parse(JSON.stringify(EMPTY_PRICING));
+        state.rateCard.pricing = { ...seed, ...parsed,
+          ladders: { ...seed.ladders, ...(parsed.ladders || {}) },
+          noCsa:   { ...seed.noCsa,   ...(parsed.noCsa   || {}) },
+          claims:  { ...seed.claims,  ...(parsed.claims  || {}) } };
+        /* Ids are the key quantities are held against on the calculator, so a
+           pasted sheet missing them, or repeating one, is repaired here rather
+           than silently tying two lines to the same box. */
+        const seen = new Set(); let n = 0;
+        for (const it of state.rateCard.pricing.items) {
+          if (!it.id || seen.has(it.id)) { do { n++; } while (seen.has("i" + n)); it.id = "i" + n; }
+          seen.add(it.id);
+        }
+        pricingInputs.qty = {};
+        saveRateCard(); render();
+        toast(state.rateCard.pricing.items.length + " pricing lines loaded.", "good");
+      }));
 
   /* --- rate card --- */
   document.querySelectorAll('[data-rc="cat"],[data-rc="wt"],[data-rc="band"]').forEach(el =>
